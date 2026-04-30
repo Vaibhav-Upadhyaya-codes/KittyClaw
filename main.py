@@ -51,7 +51,8 @@ def read_all_files_in_folder(folder_path, task_given=TASK_GIVEN):
 def generate_file_summary(content, model_name=SUMMARY_MODEL):
     """Generate a short English summary for a file without blocking ingestion on failure."""
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Summarizing",
             model=model_name,
             messages=[
                 {
@@ -101,7 +102,8 @@ def generate_file_flag(filename, notes, content, task_given, model_name=FLAG_MOD
         return 0.0
 
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Scoring files",
             model=model_name,
             messages=[
                 {
@@ -267,7 +269,11 @@ def build_document_id(file_entry):
 def generate_embeddings(documents, model_name=EMBED_MODEL):
     """Generate embeddings for a list of documents using Ollama."""
     try:
-        response = ollama.embed(model=model_name, input=documents)
+        response = ollama_embed_with_status(
+            "Embedding",
+            model=model_name,
+            input=documents,
+        )
     except Exception as error:
         raise RuntimeError(
             f"Could not generate embeddings with Ollama model '{model_name}'. "
@@ -326,6 +332,11 @@ def Identifier_pipeline():
     files_plan, file_names = generate_and_save_plan(TASK_GIVEN, data)
     print_refined_task(files_plan)
     print(f"Saved {len(files_plan)} file plans to plan.json")
+    if files_plan:
+        print("\n" + "=" * 80)
+        print("STARTING RECTIFICATION PIPELINE")
+        print("=" * 80)
+        rectification(path_of_target_folder, TASK_GIVEN)
     
 
 if __name__ == "__main__":

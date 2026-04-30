@@ -1,11 +1,86 @@
 import json
 import os
 import subprocess
+import threading
+import time
+import itertools
+import sys
 import ollama
 
 MODEL = "qwen3.5:397b-cloud"
 FILE_CONTEXT_JSON = "fileContent.json"
 PLAN_OUTPUT_JSON = "plan.json"
+ACCENT = "\033[38;2;50;205;194m"
+BG = "\033[48;2;11;16;32m"
+RESET = "\033[0m"
+THINKING_FRAMES = (
+    "✚",
+    "✢",
+    "✣",
+    "✤",
+    "✥",
+    "✦",
+    "✧",
+    "✜",
+    "✛",
+    "✖",
+    "✚",
+)
+
+
+def _prepare_terminal_output():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_status_line(label):
+    width = max(40, len(label) + 12)
+    sys.stdout.write("\r" + (" " * width) + "\r")
+    sys.stdout.flush()
+
+
+def _thinking_loop(label, stop_event):
+    frames = itertools.cycle(THINKING_FRAMES)
+    while not stop_event.is_set():
+        symbol = next(frames)
+        sys.stdout.write(f"\r{BG}{ACCENT}{label} {symbol}{RESET}")
+        sys.stdout.flush()
+        if stop_event.wait(0.11):
+            break
+    _clear_status_line(label)
+
+
+def run_with_thinking(label, func, *args, **kwargs):
+    _prepare_terminal_output()
+
+    if not getattr(sys.stdout, "isatty", lambda: False)():
+        return func(*args, **kwargs)
+
+    stop_event = threading.Event()
+    animation = threading.Thread(
+        target=_thinking_loop,
+        args=(label, stop_event),
+        daemon=True,
+    )
+    animation.start()
+
+    try:
+        return func(*args, **kwargs)
+    finally:
+        stop_event.set()
+        animation.join(timeout=1.0)
+        _clear_status_line(label)
+
+
+def ollama_chat_with_status(label, **kwargs):
+    return run_with_thinking(label, ollama.chat, **kwargs)
+
+
+def ollama_embed_with_status(label, **kwargs):
+    return run_with_thinking(label, ollama.embed, **kwargs)
 
 
 def load_file_context(json_path=FILE_CONTEXT_JSON, threshold=0.5):
@@ -137,7 +212,8 @@ def planner(task, file_entry):
     file_name = file_entry.get("name", "unknown")
     file_notes = file_entry.get("notes", "")
 
-    response = ollama.chat(
+    response = ollama_chat_with_status(
+        "Planning",
         model=MODEL,
         messages=[
             {
@@ -187,7 +263,8 @@ def refinedTask(task, file_entry):
     file_name = file_entry.get("name", "unknown")
     file_notes = file_entry.get("notes", "")
 
-    response = ollama.chat(
+    response = ollama_chat_with_status(
+        "Refining task",
         model=MODEL,
         messages=[
             {
@@ -235,7 +312,8 @@ def validate_plan_against_task(task_given, refined_task, step):
         return 0.0
 
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Validating",
             model=MODEL,
             messages=[
                 {
@@ -419,7 +497,8 @@ def apply_file_edit(file_path, current_content, step_description):
         step_description: Description of what change to make
     """
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Fixing code",
             model='qwen3.5:397b-cloud',
             messages=[
                 {
@@ -472,12 +551,6 @@ def implementing_changes(content, step, path):
         path: Full path to the file
     """
     apply_file_edit(path, content, step)
-
-import ollama
-import sys
-import time
-import itertools
-
 
 def stream_clean_response(response):
     """
