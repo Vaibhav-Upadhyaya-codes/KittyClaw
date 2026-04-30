@@ -1,0 +1,15 @@
+monitor (seeing logs of other agent) + manual task
+first task decided + memory + state
+tool selection
+perform 
+feedback
+updataion
+
+
+open file  ✅
+see the code ( reading the logs)  ✅
+analyse it according to the task given 
+identifying the error 
+write according to analyser
+navigating to the file
+reading the code code condition (retrival from RAG)

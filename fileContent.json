@@ -1,0 +1,14 @@
+[
+  {
+    "name": "test.py",
+    "notes": "This code defines a string containing hello and prints each of its characters on a new line.",
+    "content": "s = \"hello\"\nfor i in s:\nprint(i)",
+    "flag": 1.0
+  },
+  {
+    "name": "test2.c",
+    "notes": "This C program manages basic student data. It defines functions to calculate the average of a list of marks and to print a student's name and age. The main routine initializes sample data for a student, computes and displays their average score, prints their personal details, evaluates their performance based on the average, and lists each individual mark.",
+    "content": "// student_manager.c\n\n#include <stdio.h>\n\nint calculateAverage(int marks[], int size) {\n    int sum = 0;\n\n    for (int i = 0; i < size; i++) {\n        sum += marks[i];\n    }\n\n    return sum / size;\n}\n\nvoid printStudent(char name[], int age) {\n    printf(\"Name: %s\\n\", name);\n    printf(\"Age: %d\\n\", age);\n}\n\nint main() {\n    int marks[5] = {80, 75, 90, 85, 88};\n    char name[20] = \"Vaibhav\";\n\n    int avg = calculateAverage(marks, 5);\n\n    printf(\"Average Marks: %d\\n\", avg);\n\n    printStudent(name, 21);\n\n    if (avg > 80)\n        printf(\"Excellent Performance\\n\");\n    else\n        printf(\"Needs Improvement\\n\");\n\n    for (int i = 0; i < 5; i++) {\n        printf(\"Mark %d = %d\\n\", i, marks[i]);\n    }\n\n    return 0;\n}",
+    "flag": 0.0
+  }
+]
