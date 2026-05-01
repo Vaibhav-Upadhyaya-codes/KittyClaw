@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import os
@@ -5,8 +6,7 @@ import chromadb
 import ollama
 from chatbot import *
 from rectification import rectification
-
-path_of_target_folder = r"C:\Users\Vaibhav Upadhyaya\OneDrive\Documents\MASTER\terminalAi"
+from terminalAccess import run_terminal_task
 
 DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
 CHROMA_DB_PATH = os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
@@ -17,10 +17,14 @@ EMBED_MODEL = "llama3:8b"
 MODEL = "qwen3.5:397b-cloud"
 SUMMARY_MODEL = "qwen3.5:397b-cloud"
 FLAG_MODEL = "qwen3.5:397b-cloud"
-TASK_GIVEN = input("How can i help : ")
 
 
-def read_all_files_in_folder(folder_path, task_given=TASK_GIVEN):
+def resolve_target_folder(target_folder=None):
+    """Return the folder KittyClaw should analyze for the current run."""
+    return os.path.abspath(target_folder or os.getcwd())
+
+
+def read_all_files_in_folder(folder_path, task_given=""):
     """Read all files in the specified folder and return their contents."""
     file_contents = []
     for filename in os.listdir(folder_path):
@@ -138,7 +142,7 @@ def generate_file_flag(filename, notes, content, task_given, model_name=FLAG_MOD
         return 0.0
 
 
-def save_files_to_json(folder_path, output_filename="fileContent.json", task_given=TASK_GIVEN):
+def save_files_to_json(folder_path, output_filename="fileContent.json", task_given=""):
     """Read files from a folder and save them to a JSON file."""
     data = read_all_files_in_folder(folder_path, task_given=task_given)
 
@@ -325,19 +329,52 @@ def store_json_data_in_chromadb(
     )
 
 
-def Identifier_pipeline():
-    data = save_files_to_json(path_of_target_folder, task_given=TASK_GIVEN)
+def Identifier_pipeline(target_folder=None, task_given=None):
+    target_folder = resolve_target_folder(target_folder)
+    task_given = (task_given or input("How can i help : ")).strip()
+
+    if task_given.startswith("#"):
+        terminal_task = task_given[1:].strip()
+        if not terminal_task:
+            print("Terminal task cannot be empty after '#'.")
+            return
+
+        print(f"Target folder: {target_folder}")
+        print("Routing task to terminal automation.")
+        run_terminal_task(terminal_task, target_folder=target_folder)
+        return
+
+    print(f"Target folder: {target_folder}")
+    data = save_files_to_json(target_folder, task_given=task_given)
     print_flagged_files(data)
     store_json_data_in_chromadb(data)
-    files_plan, file_names = generate_and_save_plan(TASK_GIVEN, data)
+    files_plan, file_names = generate_and_save_plan(task_given, data)
     print_refined_task(files_plan)
     print(f"Saved {len(files_plan)} file plans to plan.json")
     if files_plan:
         print("\n" + "=" * 80)
         print("STARTING RECTIFICATION PIPELINE")
         print("=" * 80)
-        rectification(path_of_target_folder, TASK_GIVEN)
+        rectification(target_folder, task_given)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run KittyClaw's identify + rectify pipeline."
+    )
+    parser.add_argument(
+        "--target-folder",
+        default=None,
+        help="Folder to analyze. Defaults to the current working directory.",
+    )
+    parser.add_argument(
+        "--task",
+        default=None,
+        help="Task description. If omitted, KittyClaw will prompt for it.",
+    )
+    return parser.parse_args()
     
 
 if __name__ == "__main__":
-    Identifier_pipeline()
+    args = parse_args()
+    Identifier_pipeline(target_folder=args.target_folder, task_given=args.task)

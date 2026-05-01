@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-from setuptools import setup, find_packages
+from setuptools import setup
+
+PY_MODULES = [
+    "chatbot",
+    "kitty_mascot",
+    "main",
+    "rectification",
+    "terminalAccess",
+]
 
 setup(
     name="kittyclaw",
@@ -7,7 +15,7 @@ setup(
     description="Kitty Claw - AI-powered code rectification agent with a cute terminal mascot",
     author="Vaibhav Upadhyaya",
     python_requires=">=3.8",
-    py_modules=["kitty_mascot"],
+    py_modules=PY_MODULES,
     install_requires=[
         "ollama>=0.1.0",
         "chromadb>=0.4.0",

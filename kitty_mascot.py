@@ -7,6 +7,7 @@ import time
 ACCENT = "\033[38;2;50;205;194m"
 BG = "\033[48;2;11;16;32m"
 RESET = "\033[0m"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KITTY_OPEN_LINES = [
     "  ▄█    █▄",
@@ -126,27 +127,42 @@ def clear_screen():
     sys.stdout.flush()
 
 
-def _run_script(args):
-    subprocess.run([sys.executable] + args, check=False)
+def _script_path(script_name):
+    return os.path.join(BASE_DIR, script_name)
+
+
+def _run_script(script_name, extra_args=None, target_folder=None):
+    command = [sys.executable, _script_path(script_name)]
+    if target_folder:
+        command.extend(["--target-folder", target_folder])
+    if extra_args:
+        command.extend(extra_args)
+    subprocess.run(command, check=False)
 
 
 def launch_tui():
     enable_ansi()
+    target_folder = os.getcwd()
     while True:
         clear_screen()
         print(_banner())
+        print(_center(_panel_line(f"Target folder: {target_folder}")))
         print()
         choice = input(f"{ACCENT}Select an option > {RESET}").strip()
 
         if choice == "1":
             clear_screen()
-            _run_script(["main.py"])
+            _run_script("main.py", target_folder=target_folder)
             input(f"\n{ACCENT}Press Enter to return to Kitty Claw...{RESET}")
         elif choice == "2":
             task = input(f"{ACCENT}Enter rectification task > {RESET}").strip()
             if task:
                 clear_screen()
-                _run_script(["rectification.py", task])
+                _run_script(
+                    "rectification.py",
+                    extra_args=[task],
+                    target_folder=target_folder,
+                )
             input(f"\n{ACCENT}Press Enter to return to Kitty Claw...{RESET}")
         elif choice == "3":
             render_kitty_blink()

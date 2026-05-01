@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: kittyclaw
+Version: 0.1.0
+Summary: Kitty Claw - AI-powered code rectification agent with a cute terminal mascot
+Author: Vaibhav Upadhyaya
+Author-email: Vaibhav Upadhyaya <vaibhav@example.com>
+License: Apache-2.0
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: ollama>=0.1.0
+Requires-Dist: chromadb>=0.4.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: black>=23.0; extra == "dev"
+Dynamic: author
+Dynamic: license-file
+Dynamic: requires-python

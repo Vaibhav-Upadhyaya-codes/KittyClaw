@@ -27,7 +27,7 @@ dev = [
 kittyclaw = "kitty_mascot:launch_tui"
 
 [tool.setuptools]
-py-modules = ["kitty_mascot"]
+py-modules = ["chatbot", "kitty_mascot", "main", "rectification", "terminalAccess"]
 
 [tool.setuptools.package-data]
 "*" = ["*.txt", "*.md"]
