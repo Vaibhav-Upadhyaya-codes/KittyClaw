@@ -19,6 +19,7 @@ setup(
     install_requires=[
         "ollama>=0.1.0",
         "chromadb>=0.4.0",
+        "requests>=2.31.0",
     ],
     entry_points={
         "console_scripts": [

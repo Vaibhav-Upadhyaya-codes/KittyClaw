@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import chromadb
-import ollama
 from chatbot import *
 from rectification import rectification
 from terminalAccess import run_terminal_task
@@ -11,17 +10,137 @@ from terminalAccess import run_terminal_task
 DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
 CHROMA_DB_PATH = os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
 COLLECTION_NAME = "file_contents"
-# This is already available locally and works with `ollama.embed` in this setup.
-EMBED_MODEL = "llama3:8b"
 
 MODEL = "qwen3.5:397b-cloud"
 SUMMARY_MODEL = "qwen3.5:397b-cloud"
 FLAG_MODEL = "qwen3.5:397b-cloud"
+CHAT_EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
+CHAT_SYSTEM_PROMPTS = {
+    "ollama": (
+        "You are KittyClaw's normal conversation assistant running on the Ollama "
+        "pipeline with the qwen3.5:397b-cloud model. Reply like a helpful, natural "
+        "chatbot. Be conversational, clear, and concise."
+    ),
+    "openrouter": (
+        "You are KittyClaw's normal conversation assistant running on the OpenRouter "
+        "pipeline with the openrouter/free model. Reply like a helpful, natural "
+        "chatbot. Be conversational, clear, and concise."
+    ),
+}
 
 
 def resolve_target_folder(target_folder=None):
     """Return the folder KittyClaw should analyze for the current run."""
     return os.path.abspath(target_folder or os.getcwd())
+
+
+def classify_user_command(user_input):
+    """Route commands by prefix: # terminal, ! coding, plain text chat."""
+    text = str(user_input or "").strip()
+    if not text:
+        return "empty", ""
+    if text.startswith("#"):
+        return "terminal", text[1:].strip()
+    if text.startswith("!"):
+        return "coding", text[1:].strip()
+    return "chat", text
+
+
+def get_chat_pipeline_name(provider):
+    """Return the human-readable chat pipeline label for the active backend."""
+    if provider == "openrouter":
+        return "OpenRouter conversation pipeline (openrouter/free)"
+    return "Ollama conversation pipeline (qwen3.5:397b-cloud)"
+
+
+def run_chat_pipeline(message, conversation_history):
+    """Reply as a normal chatbot using the selected provider pipeline."""
+    provider = get_llm_provider()
+    system_prompt = CHAT_SYSTEM_PROMPTS.get(provider, CHAT_SYSTEM_PROMPTS["ollama"])
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": message})
+
+    print(f"KittyClaw : ", end="", flush=True)
+    chunks = []
+    for chunk in stream_llm_chat(messages=messages):
+        print(chunk, end="", flush=True)
+        chunks.append(chunk)
+    print()
+    reply = "".join(chunks).strip()
+
+    conversation_history.append({"role": "user", "content": message})
+    conversation_history.append({"role": "assistant", "content": reply})
+
+
+def run_coding_agent_pipeline(target_folder, task_given):
+    """Run the identify + plan + rectify coding workflow."""
+    print(f"Target folder: {target_folder}")
+    print("Routing task to coding agent.")
+    data = save_files_to_json(target_folder, task_given=task_given)
+    print_flagged_files(data)
+    store_json_data_in_chromadb(data)
+    files_plan, _ = generate_and_save_plan(task_given, data)
+    print_refined_task(files_plan)
+    print(f"Saved {len(files_plan)} file plans to plan.json")
+    if files_plan:
+        print("\n" + "=" * 80)
+        print("STARTING RECTIFICATION PIPELINE")
+        print("=" * 80)
+        rectification(target_folder, task_given)
+    else:
+        print("No actionable coding plan was generated.")
+
+
+def route_user_command(user_input, target_folder, conversation_history):
+    """Dispatch a single user input to terminal, coding, or chat pipelines."""
+    route, payload = classify_user_command(user_input)
+
+    if route == "empty":
+        print("Input cannot be empty.")
+        return True
+
+    if route == "terminal":
+        if not payload:
+            print("Terminal task cannot be empty after '#'.")
+            return True
+        print(f"Target folder: {target_folder}")
+        print("Routing task to terminal automation.")
+        run_terminal_task(payload, target_folder=target_folder)
+        return True
+
+    if route == "coding":
+        if not payload:
+            print("Coding task cannot be empty after '!'.")
+            return True
+        run_coding_agent_pipeline(target_folder, payload)
+        return True
+
+    run_chat_pipeline(payload, conversation_history)
+    return True
+
+
+def interactive_router_loop(target_folder, initial_task=None):
+    """Keep the router running so plain text behaves like a normal chatbot."""
+    conversation_history = []
+
+    if initial_task is not None:
+        route_user_command(initial_task, target_folder, conversation_history)
+        return
+
+    print("\nMode routing:")
+    print("  #task  -> terminal automation")
+    print("  !task  -> coding agent pipeline")
+    print("  text   -> normal chatbot conversation")
+    print("Type exit or quit to leave.\n")
+
+    while True:
+        user_input = input("How can i help : ").strip()
+        if user_input.lower() in CHAT_EXIT_COMMANDS:
+            print("Exiting KittyClaw.")
+            break
+        route_user_command(user_input, target_folder, conversation_history)
 
 
 def read_all_files_in_folder(folder_path, task_given=""):
@@ -270,19 +389,32 @@ def build_document_id(file_entry):
     return f'{file_entry["name"]}-{digest}'
 
 
-def generate_embeddings(documents, model_name=EMBED_MODEL):
-    """Generate embeddings for a list of documents using Ollama."""
+def generate_embeddings(documents, model_name=None):
+    """Generate embeddings for a list of documents using the active backend."""
+    provider = get_llm_provider()
+    resolved_model = resolve_embedding_model(model_name)
+
     try:
-        response = ollama_embed_with_status(
+        response = embed_with_status(
             "Embedding",
-            model=model_name,
+            model=resolved_model,
             input=documents,
         )
     except Exception as error:
+        if provider == "openrouter":
+            raise RuntimeError(
+                f"Could not generate embeddings with OpenRouter model "
+                f"'{resolved_model}'. Make sure OPENROUTER_API_KEY is set and "
+                "OPENROUTER_EMBED_MODEL points to an embedding-capable model, "
+                "for example `openai/text-embedding-3-small`. "
+                f"Original error: {error}"
+            ) from error
+
         raise RuntimeError(
-            f"Could not generate embeddings with Ollama model '{model_name}'. "
+            f"Could not generate embeddings with Ollama model '{resolved_model}'. "
             "Make sure Ollama is running and the embedding model is available. "
-            f"For example: `ollama pull {model_name}`. Original error: {error}"
+            f"For example: `ollama pull {resolved_model}`. "
+            f"Original error: {error}"
         ) from error
 
     return response["embeddings"]
@@ -292,7 +424,7 @@ def store_json_data_in_chromadb(
     data,
     db_path=CHROMA_DB_PATH,
     collection_name=COLLECTION_NAME,
-    embed_model=EMBED_MODEL,
+    embed_model=None,
 ):
     """Store each JSON object as a separate document in ChromaDB."""
     if not data:
@@ -330,37 +462,17 @@ def store_json_data_in_chromadb(
 
 
 def Identifier_pipeline(target_folder=None, task_given=None):
+    """Entry point that routes #, !, and plain chat requests."""
     target_folder = resolve_target_folder(target_folder)
-    task_given = (task_given or input("How can i help : ")).strip()
-
-    if task_given.startswith("#"):
-        terminal_task = task_given[1:].strip()
-        if not terminal_task:
-            print("Terminal task cannot be empty after '#'.")
-            return
-
-        print(f"Target folder: {target_folder}")
-        print("Routing task to terminal automation.")
-        run_terminal_task(terminal_task, target_folder=target_folder)
-        return
-
+    provider = choose_llm_provider()
+    print(f"LLM backend: {provider}")
     print(f"Target folder: {target_folder}")
-    data = save_files_to_json(target_folder, task_given=task_given)
-    print_flagged_files(data)
-    store_json_data_in_chromadb(data)
-    files_plan, file_names = generate_and_save_plan(task_given, data)
-    print_refined_task(files_plan)
-    print(f"Saved {len(files_plan)} file plans to plan.json")
-    if files_plan:
-        print("\n" + "=" * 80)
-        print("STARTING RECTIFICATION PIPELINE")
-        print("=" * 80)
-        rectification(target_folder, task_given)
+    interactive_router_loop(target_folder, initial_task=task_given)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run KittyClaw's identify + rectify pipeline."
+        description="Run KittyClaw's routed terminal, coding, and chat pipelines."
     )
     parser.add_argument(
         "--target-folder",
@@ -370,11 +482,17 @@ def parse_args():
     parser.add_argument(
         "--task",
         default=None,
-        help="Task description. If omitted, KittyClaw will prompt for it.",
+        help="Single input to route once. If omitted, KittyClaw starts an interactive session.",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="LLM backend to use: openrouter or ollama. If omitted, KittyClaw will ask at startup.",
     )
     return parser.parse_args()
     
 
 if __name__ == "__main__":
     args = parse_args()
+    choose_llm_provider(preferred=args.provider)
     Identifier_pipeline(target_folder=args.target_folder, task_given=args.task)

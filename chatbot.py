@@ -1,5 +1,6 @@
 import json
 import os
+import requests
 import subprocess
 import threading
 import time
@@ -7,7 +8,21 @@ import itertools
 import sys
 import ollama
 
-MODEL = "qwen3.5:397b-cloud"
+MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OLLAMA_EMBED_MODEL = os.environ.get("SOFTMOTHER_OLLAMA_EMBED_MODEL", "llama3:8b")
+OPENROUTER_EMBED_MODEL = os.environ.get(
+    "OPENROUTER_EMBED_MODEL",
+    "openai/text-embedding-3-small",
+)
+OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
+OPENROUTER_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY",
+    "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",
+)
+LLM_PROVIDER_ENV = "SOFTMOTHER_LLM_PROVIDER"
+ACTIVE_LLM_PROVIDER = None
 FILE_CONTEXT_JSON = "fileContent.json"
 PLAN_OUTPUT_JSON = "plan.json"
 ACCENT = "\033[38;2;50;205;194m"
@@ -75,12 +90,308 @@ def run_with_thinking(label, func, *args, **kwargs):
         _clear_status_line(label)
 
 
+def normalize_llm_provider(provider):
+    """Normalize accepted backend names to 'openrouter' or 'ollama'."""
+    normalized = str(provider or "").strip().lower()
+    aliases = {
+        "1": "openrouter",
+        "openrouter": "openrouter",
+        "open route": "openrouter",
+        "openroute": "openrouter",
+        "cloud": "openrouter",
+        "2": "ollama",
+        "ollama": "ollama",
+        "local": "ollama",
+    }
+    return aliases.get(normalized)
+
+
+def set_llm_provider(provider):
+    """Persist the selected LLM backend for the current process."""
+    global ACTIVE_LLM_PROVIDER
+
+    normalized = normalize_llm_provider(provider)
+    if normalized not in {"openrouter", "ollama"}:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    ACTIVE_LLM_PROVIDER = normalized
+    os.environ[LLM_PROVIDER_ENV] = normalized
+    return normalized
+
+
+def choose_llm_provider(preferred=None, prompt_user=True):
+    """Select the LLM backend once, prompting the user when needed."""
+    global ACTIVE_LLM_PROVIDER
+
+    if ACTIVE_LLM_PROVIDER:
+        return ACTIVE_LLM_PROVIDER
+
+    preset = normalize_llm_provider(preferred) or normalize_llm_provider(
+        os.environ.get(LLM_PROVIDER_ENV)
+    )
+    if preset:
+        return set_llm_provider(preset)
+
+    if not prompt_user or not getattr(sys.stdin, "isatty", lambda: False)():
+        return set_llm_provider("ollama")
+
+    print("\nChoose the LLM backend:")
+    print("1. OpenRouter (cloud)")
+    print("2. Ollama (local)")
+
+    while True:
+        choice = input("Select backend [1/2]: ").strip()
+        normalized = normalize_llm_provider(choice)
+        if normalized:
+            return set_llm_provider(normalized)
+        print("Please choose 1 for OpenRouter or 2 for Ollama.")
+
+
+def get_llm_provider():
+    """Return the active LLM backend, prompting once if necessary."""
+    return choose_llm_provider()
+
+
+def resolve_chat_model(requested_model=None):
+    """Map chat prompts to the active backend's model."""
+    if get_llm_provider() == "openrouter":
+        return OPENROUTER_MODEL
+    return requested_model or MODEL
+
+
+def resolve_embedding_model(requested_model=None):
+    """Map embedding requests to the active backend's model."""
+    if get_llm_provider() == "openrouter":
+        return requested_model or OPENROUTER_EMBED_MODEL
+    return requested_model or OLLAMA_EMBED_MODEL
+
+
+def _extract_openrouter_delta(payload):
+    """Extract streamed token text from an OpenRouter SSE chunk."""
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, list):
+            parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            return "".join(parts)
+        if content:
+            return str(content)
+
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+        return "".join(parts)
+    if content:
+        return str(content)
+
+    return ""
+
+
+def openrouter_chat(model=None, messages=None, **kwargs):
+    """Call OpenRouter's chat completions API and return an Ollama-like shape."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+        )
+
+    payload = {
+        "model": resolve_chat_model(model),
+        "messages": messages or [],
+        "stream": True,
+    }
+
+    for key, value in kwargs.items():
+        if key == "stream" or value is None:
+            continue
+        payload[key] = value
+
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        stream=True,
+        timeout=300,
+    )
+    response.raise_for_status()
+
+    reply = ""
+    for chunk in response.iter_lines():
+        if not chunk:
+            continue
+
+        data = chunk.decode("utf-8")
+        if not data.startswith("data: "):
+            continue
+
+        body = data[6:]
+        if body.strip() == "[DONE]":
+            break
+
+        try:
+            payload_chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+        reply += _extract_openrouter_delta(payload_chunk)
+
+    return {"message": {"content": reply}}
+
+
+def _stream_openrouter_chat(model=None, messages=None, **kwargs):
+    """Yield streamed text chunks from OpenRouter chat completions."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+        )
+
+    payload = {
+        "model": resolve_chat_model(model),
+        "messages": messages or [],
+        "stream": True,
+    }
+
+    for key, value in kwargs.items():
+        if key == "stream" or value is None:
+            continue
+        payload[key] = value
+
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        stream=True,
+        timeout=300,
+    )
+    response.raise_for_status()
+
+    for chunk in response.iter_lines():
+        if not chunk:
+            continue
+
+        data = chunk.decode("utf-8")
+        if not data.startswith("data: "):
+            continue
+
+        body = data[6:]
+        if body.strip() == "[DONE]":
+            break
+
+        try:
+            payload_chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+        text = _extract_openrouter_delta(payload_chunk)
+        if text:
+            yield text
+
+
+def _extract_ollama_stream_chunk(chunk):
+    """Extract streamed token text from an Ollama chat chunk."""
+    if isinstance(chunk, dict):
+        message = chunk.get("message") or {}
+        return str(message.get("content") or "")
+
+    message = getattr(chunk, "message", None)
+    if message is not None:
+        content = getattr(message, "content", "")
+        if content:
+            return str(content)
+
+    return ""
+
+
+def llm_chat(**kwargs):
+    """Dispatch chat prompts to the selected backend."""
+    if get_llm_provider() == "openrouter":
+        return openrouter_chat(**kwargs)
+    kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+    return ollama.chat(**kwargs)
+
+
 def ollama_chat_with_status(label, **kwargs):
-    return run_with_thinking(label, ollama.chat, **kwargs)
+    return run_with_thinking(label, llm_chat, **kwargs)
+
+
+def stream_llm_chat(**kwargs):
+    """Yield streamed text chunks from the selected chat backend."""
+    if get_llm_provider() == "openrouter":
+        yield from _stream_openrouter_chat(**kwargs)
+        return
+
+    kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+    kwargs["stream"] = True
+    for chunk in ollama.chat(**kwargs):
+        text = _extract_ollama_stream_chunk(chunk)
+        if text:
+            yield text
+
+
+def openrouter_embed(model=None, input=None, **kwargs):
+    """Call OpenRouter's embeddings API and return an Ollama-like shape."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+        )
+
+    payload = {
+        "model": resolve_embedding_model(model),
+        "input": input,
+        "encoding_format": "float",
+    }
+
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        payload[key] = value
+
+    response = requests.post(
+        OPENROUTER_EMBED_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=300,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    embeddings = [
+        item["embedding"]
+        for item in data.get("data", [])
+        if isinstance(item, dict) and "embedding" in item
+    ]
+    return {"embeddings": embeddings, "model": data.get("model")}
+
+
+def llm_embed(**kwargs):
+    """Dispatch embedding requests to the selected backend."""
+    kwargs["model"] = resolve_embedding_model(kwargs.get("model"))
+    if get_llm_provider() == "openrouter":
+        return openrouter_embed(**kwargs)
+    return ollama.embed(**kwargs)
+
+
+def embed_with_status(label, **kwargs):
+    return run_with_thinking(label, llm_embed, **kwargs)
 
 
 def ollama_embed_with_status(label, **kwargs):
-    return run_with_thinking(label, ollama.embed, **kwargs)
+    return embed_with_status(label, **kwargs)
+
 
 
 def load_file_context(json_path=FILE_CONTEXT_JSON, threshold=0.5):

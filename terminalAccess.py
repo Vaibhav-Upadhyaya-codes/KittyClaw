@@ -2,9 +2,15 @@ import argparse
 import atexit
 import json
 import os
+import re
 import subprocess
 
-from chatbot import extract_json_text, normalize_plan, ollama_chat_with_status
+from chatbot import (
+    choose_llm_provider,
+    extract_json_text,
+    normalize_plan,
+    ollama_chat_with_status,
+)
 
 MODEL = "qwen3.5:397b-cloud"
 JSON_FILE = "instance.json"
@@ -12,6 +18,63 @@ TERMINAL_PLAN_FILE = "terminal_plan.json"
 DEFAULT_MAX_ITERATIONS = 20
 
 _ps_process = None
+CMDLET_PATTERN = re.compile(r"^[A-Za-z]+-[A-Za-z]+$")
+PATH_PREFIX_PATTERN = re.compile(r"^(?:[A-Za-z]:\\|\.\\|\.\/|\\)")
+KNOWN_NATIVE_COMMANDS = {
+    "python",
+    "py",
+    "pip",
+    "pip3",
+    "git",
+    "npm",
+    "npx",
+    "node",
+    "uv",
+    "pytest",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "dir",
+    "ls",
+    "mkdir",
+    "rmdir",
+    "copy",
+    "move",
+    "ren",
+    "del",
+    "type",
+    "echo",
+    "where",
+}
+POWERSHELL_KEYWORDS = {
+    "if",
+    "elseif",
+    "else",
+    "foreach",
+    "for",
+    "while",
+    "switch",
+    "try",
+    "catch",
+    "finally",
+    "function",
+    "filter",
+    "return",
+    "param",
+}
+NARRATION_MARKERS = (
+    "\\boxed{",
+    "final answer",
+    "final decision",
+    "however, adhering",
+    "here's the final choice",
+    "using the previous error",
+    "wait but maybe",
+    "considering the user wants",
+    "the safest answer",
+    "the correct, minimal",
+    "ultimately,",
+)
 
 
 def _escape_powershell_single_quotes(value):
@@ -118,6 +181,24 @@ def print_terminal_plan(task, plan):
     print("=" * 80)
 
 
+def default_terminal_plan():
+    """Return a safe fallback plan when the model does not return valid JSON."""
+    return [
+        {
+            "step": "Inspect the working directory and identify the exact target path.",
+            "tools": ["powershell"],
+        },
+        {
+            "step": "Apply the requested filesystem or command changes.",
+            "tools": ["powershell"],
+        },
+        {
+            "step": "Verify the requested result exists and matches the task.",
+            "tools": ["powershell"],
+        },
+    ]
+
+
 def clean_command(command):
     """Clean and normalize a model-generated PowerShell command."""
     cleaned = str(command or "").strip()
@@ -148,6 +229,42 @@ def clean_command(command):
     return cleaned.strip()
 
 
+def _line_starts_like_command(line):
+    """Heuristically validate that each line starts like PowerShell/code, not prose."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+
+    if stripped.startswith(("#", "$", "[", "(", "{", "@")):
+        return True
+
+    first_token = stripped.split()[0].rstrip(";")
+    normalized_token = first_token.lower()
+
+    if normalized_token in POWERSHELL_KEYWORDS:
+        return True
+
+    if CMDLET_PATTERN.match(first_token):
+        return True
+
+    if PATH_PREFIX_PATTERN.match(first_token):
+        return True
+
+    if normalized_token in KNOWN_NATIVE_COMMANDS:
+        return True
+
+    return False
+
+
+def contains_narration(command):
+    """Reject model chatter that slips past basic quote validation."""
+    lowered = command.lower()
+    if any(marker in lowered for marker in NARRATION_MARKERS):
+        return True
+
+    return '"command"' in lowered or '"complete"' in lowered
+
+
 def is_valid_command(command):
     """Basic validation for generated commands."""
     if not command or len(command) < 2:
@@ -159,7 +276,37 @@ def is_valid_command(command):
     single_quotes = command.count("'") - command.count("\\'")
     double_quotes = command.count('"') - command.count('\\"')
 
-    return single_quotes % 2 == 0 and double_quotes % 2 == 0
+    if single_quotes % 2 != 0 or double_quotes % 2 != 0:
+        return False
+
+    if contains_narration(command):
+        return False
+
+    lines = [line for line in command.splitlines() if line.strip()]
+    if len(lines) > 12:
+        return False
+
+    return all(_line_starts_like_command(line) for line in lines)
+
+
+def parse_command_response(raw_text):
+    """Parse a structured model response into a command or TASK COMPLETE."""
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+
+    json_text = extract_json_text(text)
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return clean_command(text)
+
+    if isinstance(parsed, dict):
+        if parsed.get("complete") is True:
+            return "TASK COMPLETE"
+        return clean_command(parsed.get("command", ""))
+
+    return clean_command(text)
 
 
 def execute_powershell_command(command, working_directory=None):
@@ -235,9 +382,10 @@ def generate_terminal_plan(task):
     try:
         parsed = json.loads(json_text)
     except json.JSONDecodeError:
-        return []
+        return default_terminal_plan()
 
-    return normalize_plan(parsed)
+    normalized = normalize_plan(parsed)
+    return normalized or default_terminal_plan()
 
 
 def generate_command(task, plan, working_directory):
@@ -254,10 +402,14 @@ def generate_command(task, plan, working_directory):
                 "role": "system",
                 "content": (
                     "You are a PowerShell command writer. "
-                    "Return exactly one PowerShell command, or return TASK COMPLETE if the task is finished. "
-                    "Do not include markdown, code fences, labels, or explanations. "
+                    "Return only valid JSON with exactly two keys: "
+                    '"command" and "complete". '
+                    'Example incomplete response: {"command":"Get-ChildItem","complete":false}. '
+                    'Example complete response: {"command":"","complete":true}. '
+                    "Do not include markdown, code fences, labels, prose, or explanations. "
                     "Use the existing command history to avoid repeating failed work. "
-                    "Prefer inspecting files before changing them when needed."
+                    "Prefer inspecting files before changing them when needed. "
+                    "When a Windows path contains spaces, always wrap it in quotes."
                 ),
             },
             {
@@ -267,14 +419,14 @@ def generate_command(task, plan, working_directory):
                     f"Working directory: {working_directory}\n\n"
                     f"Plan:\n{plan_text}\n\n"
                     f"Command history with results:\n{history_text}\n\n"
-                    "Return only the single best next PowerShell command. "
-                    "If the task is fully completed, return TASK COMPLETE."
+                    "Return only the single best next PowerShell command inside the JSON schema. "
+                    "If the task is fully completed, set complete to true."
                 ),
             },
         ],
     )
 
-    return clean_command(response["message"]["content"])
+    return parse_command_response(response["message"]["content"])
 
 
 def normalize_terminal_task(task):
@@ -287,6 +439,7 @@ def normalize_terminal_task(task):
 
 def run_terminal_task(task, target_folder=None, max_iterations=DEFAULT_MAX_ITERATIONS):
     """Run a terminal-only task by first planning it, then executing commands."""
+    provider = choose_llm_provider()
     working_directory = os.path.abspath(target_folder or os.getcwd())
     normalized_task = normalize_terminal_task(task)
 
@@ -304,6 +457,7 @@ def run_terminal_task(task, target_folder=None, max_iterations=DEFAULT_MAX_ITERA
     print("\n" + "=" * 80)
     print("STARTING TERMINAL AUTOMATION")
     print("=" * 80)
+    print(f"LLM backend: {provider}")
     print(f"Working directory: {working_directory}")
 
     completed = False
@@ -360,11 +514,17 @@ def parse_args():
         default=DEFAULT_MAX_ITERATIONS,
         help="Maximum number of commands the terminal agent may execute.",
     )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="LLM backend to use: openrouter or ollama. If omitted, KittyClaw will ask at startup.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    choose_llm_provider(preferred=args.provider)
     task = args.task or input("Enter terminal task: ").strip()
     run_terminal_task(
         task=task,
