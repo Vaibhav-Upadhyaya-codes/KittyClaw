@@ -7,24 +7,65 @@ import time
 import itertools
 import sys
 import ollama
+from chromadb.utils import embedding_functions
+
+
+def _load_claude_env():
+    """Load env vars from Claude Code settings.json if not already set."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, ".claude", "settings.json"),
+        os.path.join(base, ".claude", "settings.local.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            env = data.get("env", {})
+            for k, v in env.items():
+                if k not in os.environ:
+                    os.environ[k] = v
+            break
+        except Exception:
+            continue
+
+
+_load_claude_env()
 
 MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL",
+    os.environ.get("ANTHROPIC_MODEL", "openrouter/free"),
+)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OLLAMA_EMBED_MODEL = os.environ.get("SOFTMOTHER_OLLAMA_EMBED_MODEL", "llama3:8b")
-OPENROUTER_EMBED_MODEL = os.environ.get(
-    "OPENROUTER_EMBED_MODEL",
-    "openai/text-embedding-3-small",
+OPENROUTER_API_KEY = (
+    os.environ.get("OPENROUTER_API_KEY")
+    or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    or os.environ.get("ANTHROPIC_API_KEY")
+    or "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"
 )
-OPENROUTER_EMBED_URL = "https://openrouter.ai/api/v1/embeddings"
-OPENROUTER_API_KEY = os.environ.get(
-    "OPENROUTER_API_KEY",
-    "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",
-)
+OPENROUTER_UNAVAILABLE_MESSAGE = "Currntly unavailable"
+
+def normalize_openrouter_model(model):
+    """Convert generic free‑model aliases to real OpenRouter model IDs."""
+    if not model:
+        return "openrouter/free"
+    # Strip the "openrouter/" prefix that Claude Code uses
+    if model.startswith("openrouter/"):
+        model = model[len("openrouter/"):]
+    # If the alias is just "free", pick a concrete free model
+    if model == "free":
+        model = "openrouter/free"
+    return model
 LLM_PROVIDER_ENV = "SOFTMOTHER_LLM_PROVIDER"
 ACTIVE_LLM_PROVIDER = None
 FILE_CONTEXT_JSON = "fileContent.json"
 PLAN_OUTPUT_JSON = "plan.json"
+DEFAULT_CHROMA_COLLECTION = "file_contents"
 ACCENT = "\033[38;2;50;205;194m"
 BG = "\033[48;2;11;16;32m"
 RESET = "\033[0m"
@@ -155,15 +196,27 @@ def get_llm_provider():
 def resolve_chat_model(requested_model=None):
     """Map chat prompts to the active backend's model."""
     if get_llm_provider() == "openrouter":
-        return OPENROUTER_MODEL
+        return normalize_openrouter_model(OPENROUTER_MODEL)
     return requested_model or MODEL
 
 
-def resolve_embedding_model(requested_model=None):
-    """Map embedding requests to the active backend's model."""
-    if get_llm_provider() == "openrouter":
-        return requested_model or OPENROUTER_EMBED_MODEL
-    return requested_model or OLLAMA_EMBED_MODEL
+def get_chroma_embedding_function():
+    """Return ChromaDB's built-in/default embedding function."""
+    return embedding_functions.DefaultEmbeddingFunction()
+
+
+def resolve_chroma_collection_name(collection_name=None, model_name=None, provider=None):
+    """Return the shared ChromaDB collection name used for file storage."""
+    if collection_name:
+        return collection_name
+    return DEFAULT_CHROMA_COLLECTION
+
+
+def raise_for_openrouter_response(response):
+    """Raise a friendly message for OpenRouter rate limiting."""
+    if response.status_code == 429:
+        raise RuntimeError(OPENROUTER_UNAVAILABLE_MESSAGE)
+    response.raise_for_status()
 
 
 def _extract_openrouter_delta(payload):
@@ -216,12 +269,22 @@ def openrouter_chat(model=None, messages=None, **kwargs):
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://softmother.local",
+            "X-Title": "KittyClaw",
         },
         json=payload,
         stream=True,
         timeout=300,
     )
-    response.raise_for_status()
+    if response.status_code != 200:
+        try:
+            err = response.json()
+        except Exception:
+            err = response.text[:200]
+        raise RuntimeError(
+            f"OpenRouter error {response.status_code}: {err}"
+        )
+    raise_for_openrouter_response(response)
 
     reply = ""
     for chunk in response.iter_lines():
@@ -245,6 +308,54 @@ def openrouter_chat(model=None, messages=None, **kwargs):
 
     return {"message": {"content": reply}}
 
+# ----- Safe wrapper with retries -----
+def safe_openrouter_chat(retries: int = 3, backoff: float = 1.0, **kwargs):
+    """Call OpenRouter with simple retry logic.
+    Retries on the custom UNAVAILABLE message. If all attempts fail, falls back to Ollama.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return openrouter_chat(**kwargs)
+        except RuntimeError as e:
+            # Detect our custom unavailable message
+            if OPENROUTER_UNAVAILABLE_MESSAGE.lower() in str(e).lower():
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+                    continue
+                # final attempt failed – fall back to Ollama
+                kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+                return ollama.chat(**kwargs)
+            # any other error propagates
+            raise
+    # Should never reach here
+    raise RuntimeError("OpenRouter failed after retries")
+
+
+def safe_stream_openrouter_chat(retries: int = 3, backoff: float = 1.0, **kwargs):
+    """Stream from OpenRouter with retry logic.
+    Retries on unavailable model errors. Falls back to Ollama streaming if all attempts fail.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            gen = _stream_openrouter_chat(**kwargs)
+            for chunk in gen:
+                yield chunk
+            return
+        except RuntimeError as e:
+            if OPENROUTER_UNAVAILABLE_MESSAGE.lower() in str(e).lower():
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+                    continue
+                # final attempt failed – fall back to Ollama streaming
+                kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+                kwargs["stream"] = True
+                for chunk in ollama.chat(**kwargs):
+                    text = _extract_ollama_stream_chunk(chunk)
+                    if text:
+                        yield text
+                return
+            raise
+
 
 def _stream_openrouter_chat(model=None, messages=None, **kwargs):
     """Yield streamed text chunks from OpenRouter chat completions."""
@@ -253,8 +364,9 @@ def _stream_openrouter_chat(model=None, messages=None, **kwargs):
             "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
         )
 
+    model_id = resolve_chat_model(model)
     payload = {
-        "model": resolve_chat_model(model),
+        "model": model_id,
         "messages": messages or [],
         "stream": True,
     }
@@ -264,17 +376,32 @@ def _stream_openrouter_chat(model=None, messages=None, **kwargs):
             continue
         payload[key] = value
 
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://softmother.local",
+        "X-Title": "KittyClaw",
+    }
+
     response = requests.post(
         OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         json=payload,
         stream=True,
         timeout=300,
     )
-    response.raise_for_status()
+
+    if response.status_code != 200:
+        try:
+            err_body = response.json()
+        except Exception:
+            err_body = response.text[:500]
+        raise RuntimeError(
+            f"OpenRouter {response.status_code}: "
+            f"model={model_id} | key={OPENROUTER_API_KEY[:10]}... | {err_body}"
+        )
+
+    raise_for_openrouter_response(response)
 
     for chunk in response.iter_lines():
         if not chunk:
@@ -314,9 +441,9 @@ def _extract_ollama_stream_chunk(chunk):
 
 
 def llm_chat(**kwargs):
-    """Dispatch chat prompts to the selected backend."""
+    """Dispatch chat prompts to the selected backend with retry handling for OpenRouter."""
     if get_llm_provider() == "openrouter":
-        return openrouter_chat(**kwargs)
+        return safe_openrouter_chat(**kwargs)
     kwargs["model"] = resolve_chat_model(kwargs.get("model"))
     return ollama.chat(**kwargs)
 
@@ -326,9 +453,9 @@ def ollama_chat_with_status(label, **kwargs):
 
 
 def stream_llm_chat(**kwargs):
-    """Yield streamed text chunks from the selected chat backend."""
+    """Yield streamed text chunks from the selected chat backend with retries for OpenRouter."""
     if get_llm_provider() == "openrouter":
-        yield from _stream_openrouter_chat(**kwargs)
+        yield from safe_stream_openrouter_chat(**kwargs)
         return
 
     kwargs["model"] = resolve_chat_model(kwargs.get("model"))
@@ -337,61 +464,6 @@ def stream_llm_chat(**kwargs):
         text = _extract_ollama_stream_chunk(chunk)
         if text:
             yield text
-
-
-def openrouter_embed(model=None, input=None, **kwargs):
-    """Call OpenRouter's embeddings API and return an Ollama-like shape."""
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError(
-            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
-        )
-
-    payload = {
-        "model": resolve_embedding_model(model),
-        "input": input,
-        "encoding_format": "float",
-    }
-
-    for key, value in kwargs.items():
-        if value is None:
-            continue
-        payload[key] = value
-
-    response = requests.post(
-        OPENROUTER_EMBED_URL,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=300,
-    )
-    response.raise_for_status()
-
-    data = response.json()
-    embeddings = [
-        item["embedding"]
-        for item in data.get("data", [])
-        if isinstance(item, dict) and "embedding" in item
-    ]
-    return {"embeddings": embeddings, "model": data.get("model")}
-
-
-def llm_embed(**kwargs):
-    """Dispatch embedding requests to the selected backend."""
-    kwargs["model"] = resolve_embedding_model(kwargs.get("model"))
-    if get_llm_provider() == "openrouter":
-        return openrouter_embed(**kwargs)
-    return ollama.embed(**kwargs)
-
-
-def embed_with_status(label, **kwargs):
-    return run_with_thinking(label, llm_embed, **kwargs)
-
-
-def ollama_embed_with_status(label, **kwargs):
-    return embed_with_status(label, **kwargs)
-
 
 
 def load_file_context(json_path=FILE_CONTEXT_JSON, threshold=0.5):
@@ -763,7 +835,7 @@ def get_file_content_from_chromadb(file_name, db_path=None, collection_name=None
     Args:
         file_name: Name of the file to retrieve
         db_path: Path to ChromaDB (defaults to CHROMA_DB_PATH from main.py)
-        collection_name: Collection name (defaults to COLLECTION_NAME)
+        collection_name: Collection name (defaults to file_contents)
 
     Returns:
         dict with file content and metadata, or None if not found
@@ -773,27 +845,39 @@ def get_file_content_from_chromadb(file_name, db_path=None, collection_name=None
 
     DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
     db_path = db_path or os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
-    collection_name = collection_name or "file_contents"
+    resolved_collection_name = resolve_chroma_collection_name(
+        collection_name=collection_name
+    )
+    collection_names = [resolved_collection_name]
 
     try:
         client = chromadb.PersistentClient(path=db_path)
-        collection = client.get_collection(name=collection_name)
+        for candidate in collection_names:
+            try:
+                collection = client.get_collection(
+                    name=candidate,
+                    embedding_function=get_chroma_embedding_function(),
+                )
+            except Exception:
+                continue
 
-        # Query by metadata (file name)
-        results = collection.get(
-            where={"name": file_name},
-            include=["documents", "metadatas"]
+            results = collection.get(
+                where={"name": file_name},
+                include=["documents", "metadatas"]
+            )
+
+            if results["ids"] and len(results["ids"]) > 0:
+                return {
+                    "file_name": file_name,
+                    "content": results["documents"][0],
+                    "metadata": results["metadatas"][0] if results["metadatas"] else {},
+                }
+
+        print(
+            f"File '{file_name}' not found in ChromaDB collections: "
+            f"{', '.join(collection_names)}."
         )
-
-        if results["ids"] and len(results["ids"]) > 0:
-            return {
-                "file_name": file_name,
-                "content": results["documents"][0],
-                "metadata": results["metadatas"][0] if results["metadatas"] else {},
-            }
-        else:
-            print(f"File '{file_name}' not found in ChromaDB.")
-            return None
+        return None
 
     except Exception as error:
         print(f"Error retrieving file from ChromaDB: {error}")

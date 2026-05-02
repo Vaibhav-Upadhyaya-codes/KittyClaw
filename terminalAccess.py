@@ -6,6 +6,7 @@ import re
 import subprocess
 
 from chatbot import (
+    apply_file_edit,
     choose_llm_provider,
     extract_json_text,
     normalize_plan,
@@ -16,6 +17,7 @@ MODEL = "qwen3.5:397b-cloud"
 JSON_FILE = "instance.json"
 TERMINAL_PLAN_FILE = "terminal_plan.json"
 DEFAULT_MAX_ITERATIONS = 20
+MAX_PROJECT_FILES_IN_PROMPT = 200
 
 _ps_process = None
 CMDLET_PATTERN = re.compile(r"^[A-Za-z]+-[A-Za-z]+$")
@@ -144,6 +146,19 @@ def save_to_json(command, result):
     data.append(
         {
             "command": command,
+            "result": result,
+        }
+    )
+    with open(JSON_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
+
+
+def save_action_to_json(action, result):
+    """Save a structured terminal action and its result to JSON file."""
+    data = load_json_data()
+    data.append(
+        {
+            "action": action,
             "result": result,
         }
     )
@@ -360,6 +375,9 @@ def generate_terminal_plan(task):
                     '"step" and "tools". '
                     '"step" must be a concise, concrete action. '
                     '"tools" must be an array of strings. '
+                    "If a step requires creating or editing file contents, the step must mention the exact relative file path when known "
+                    'and the tools should include "llm" and "file_handling". '
+                    'Use "powershell" in tools for shell commands, inspection, setup, and verification. '
                     "Keep the plan strict to the user's request. "
                     "Do not include markdown fences or any explanation outside JSON."
                 ),
@@ -429,6 +447,175 @@ def generate_command(task, plan, working_directory):
     return parse_command_response(response["message"]["content"])
 
 
+def list_project_files(working_directory, max_files=MAX_PROJECT_FILES_IN_PROMPT):
+    """Return a compact list of project files to help the model target edits."""
+    ignored_dirs = {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        "dist",
+        "build",
+    }
+    collected = []
+
+    for root, dirs, files in os.walk(working_directory):
+        dirs[:] = [directory for directory in dirs if directory not in ignored_dirs]
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(full_path, working_directory)
+            collected.append(relative_path)
+            if len(collected) >= max_files:
+                return collected
+
+    return collected
+
+
+def clean_relative_path(path_text):
+    """Normalize a model-provided relative file path."""
+    cleaned = str(path_text or "").strip().strip('"').strip("'")
+    cleaned = cleaned.replace("/", os.sep).replace("\\", os.sep)
+    return os.path.normpath(cleaned)
+
+
+def resolve_action_file_path(working_directory, relative_path):
+    """Resolve a relative path and ensure it stays within the working directory."""
+    cleaned_relative_path = clean_relative_path(relative_path)
+    if not cleaned_relative_path or cleaned_relative_path in {".", os.pardir}:
+        raise ValueError("File edit action did not provide a valid relative file path.")
+
+    absolute_working_directory = os.path.abspath(working_directory)
+    resolved_path = os.path.abspath(
+        os.path.join(absolute_working_directory, cleaned_relative_path)
+    )
+
+    if os.path.commonpath([absolute_working_directory, resolved_path]) != absolute_working_directory:
+        raise ValueError(
+            f"Refusing to edit file outside the working directory: {cleaned_relative_path}"
+        )
+
+    return resolved_path, os.path.relpath(resolved_path, absolute_working_directory)
+
+
+def parse_terminal_action_response(raw_text):
+    """Parse a structured model response into a terminal action dict."""
+    text = str(raw_text or "").strip()
+    empty_action = {
+        "type": "",
+        "command": "",
+        "target_file": "",
+        "instruction": "",
+        "complete": False,
+    }
+    if not text:
+        return empty_action
+
+    json_text = extract_json_text(text)
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return empty_action
+
+    if not isinstance(parsed, dict):
+        return empty_action
+
+    action_type = str(parsed.get("type", "")).strip().lower()
+    action = {
+        "type": action_type,
+        "command": clean_command(parsed.get("command", "")),
+        "target_file": clean_relative_path(parsed.get("target_file", "")),
+        "instruction": str(parsed.get("instruction", "")).strip(),
+        "complete": bool(parsed.get("complete", False)),
+    }
+    return action
+
+
+def is_valid_terminal_action(action):
+    """Validate the structured action returned by the terminal model."""
+    action_type = action.get("type", "")
+
+    if action.get("complete") is True:
+        return action_type in {"", "complete"}
+
+    if action_type == "powershell":
+        return is_valid_command(action.get("command", ""))
+
+    if action_type == "file_edit":
+        return bool(action.get("target_file")) and bool(action.get("instruction"))
+
+    return False
+
+
+def generate_next_action(task, plan, working_directory):
+    """Generate the next terminal action, allowing either shell or file editing."""
+    history = load_json_data()
+    plan_text = json.dumps(plan, indent=2, ensure_ascii=False)
+    history_text = json.dumps(history, indent=2, ensure_ascii=False)
+    project_files = list_project_files(working_directory)
+    files_text = json.dumps(project_files, indent=2, ensure_ascii=False)
+
+    response = ollama_chat_with_status(
+        "Choosing next action",
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an execution agent for a Windows terminal workflow. "
+                    "Return only valid JSON with exactly these keys: "
+                    '"type", "command", "target_file", "instruction", and "complete". '
+                    '"type" must be one of "powershell", "file_edit", or "complete". '
+                    'If "type" is "powershell", fill only "command" and set "complete" to false. '
+                    'If "type" is "file_edit", fill only "target_file" and "instruction" and set "complete" to false. '
+                    'If the task is done, set "type" to "complete" and "complete" to true. '
+                    "Do not include markdown, code fences, labels, prose, or explanations. "
+                    "Use file_edit when the next step requires writing or modifying code/text in a file. "
+                    "Use powershell for inspection, environment setup, package commands, git commands, or verification commands. "
+                    "When using file_edit, choose a relative file path from the provided project file list when possible."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task}\n\n"
+                    f"Working directory: {working_directory}\n\n"
+                    f"Plan:\n{plan_text}\n\n"
+                    f"Project files:\n{files_text}\n\n"
+                    f"Action history with results:\n{history_text}\n\n"
+                    "Return only the single best next action inside the required JSON schema."
+                ),
+            },
+        ],
+    )
+
+    return parse_terminal_action_response(response["message"]["content"])
+
+
+def execute_file_edit_action(action, working_directory):
+    """Apply a model-directed file edit using the shared LLM file editor."""
+    target_file = action.get("target_file", "")
+    instruction = action.get("instruction", "")
+    resolved_path, relative_path = resolve_action_file_path(working_directory, target_file)
+
+    os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+
+    if os.path.exists(resolved_path):
+        with open(resolved_path, "r", encoding="utf-8") as file:
+            current_content = file.read()
+    else:
+        current_content = ""
+
+    print(f"[Editing] {relative_path}")
+    print(f"Instruction: {instruction}")
+    success = apply_file_edit(resolved_path, current_content, instruction)
+    if success:
+        return f"Updated file: {relative_path}"
+    return f"Failed to update file: {relative_path}"
+
+
 def normalize_terminal_task(task):
     """Remove the routing prefix if the task starts with #."""
     normalized = (task or "").strip()
@@ -438,7 +625,7 @@ def normalize_terminal_task(task):
 
 
 def run_terminal_task(task, target_folder=None, max_iterations=DEFAULT_MAX_ITERATIONS):
-    """Run a terminal-only task by first planning it, then executing commands."""
+    """Run a terminal task using PowerShell commands and direct file edits."""
     provider = choose_llm_provider()
     working_directory = os.path.abspath(target_folder or os.getcwd())
     normalized_task = normalize_terminal_task(task)
@@ -465,22 +652,34 @@ def run_terminal_task(task, target_folder=None, max_iterations=DEFAULT_MAX_ITERA
     try:
         for iteration in range(1, max_iterations + 1):
             print(f"\nIteration {iteration}/{max_iterations}")
-            command = generate_command(normalized_task, plan, working_directory)
+            action = generate_next_action(normalized_task, plan, working_directory)
 
-            if command == "TASK COMPLETE":
+            if action.get("complete") is True or action.get("type") == "complete":
                 print("Task completed by terminal agent.")
                 completed = True
                 break
 
-            if not is_valid_command(command):
-                print(f"Invalid command generated: {command}")
-                save_to_json(command, "Skipped because the command was invalid.")
+            if not is_valid_terminal_action(action):
+                print(f"Invalid action generated: {action}")
+                save_action_to_json(action, "Skipped because the action was invalid.")
                 continue
 
-            print(f"[Executing] {command}")
-            result = execute_powershell_command(command, working_directory=working_directory)
-            print(result or "(no output)")
-            save_to_json(command, result)
+            if action["type"] == "powershell":
+                command = action.get("command", "")
+                print(f"[Executing] {command}")
+                result = execute_powershell_command(
+                    command,
+                    working_directory=working_directory,
+                )
+                print(result or "(no output)")
+                save_action_to_json(action, result)
+                continue
+
+            if action["type"] == "file_edit":
+                result = execute_file_edit_action(action, working_directory)
+                print(result)
+                save_action_to_json(action, result)
+                continue
     finally:
         close_persistent_powershell()
 

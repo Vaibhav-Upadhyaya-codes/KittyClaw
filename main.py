@@ -3,13 +3,13 @@ import hashlib
 import json
 import os
 import chromadb
+from chromadb.utils import embedding_functions
 from chatbot import *
 from rectification import rectification
 from terminalAccess import run_terminal_task
 
 DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
 CHROMA_DB_PATH = os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
-COLLECTION_NAME = "file_contents"
 
 MODEL = "qwen3.5:397b-cloud"
 SUMMARY_MODEL = "qwen3.5:397b-cloud"
@@ -64,9 +64,14 @@ def run_chat_pipeline(message, conversation_history):
 
     print(f"KittyClaw : ", end="", flush=True)
     chunks = []
-    for chunk in stream_llm_chat(messages=messages):
-        print(chunk, end="", flush=True)
-        chunks.append(chunk)
+    try:
+        for chunk in stream_llm_chat(messages=messages):
+            print(chunk, end="", flush=True)
+            chunks.append(chunk)
+    except RuntimeError as error:
+        fallback_message = str(error).strip() or OPENROUTER_UNAVAILABLE_MESSAGE
+        print(fallback_message, end="", flush=True)
+        chunks = [fallback_message]
     print()
     reply = "".join(chunks).strip()
 
@@ -101,23 +106,27 @@ def route_user_command(user_input, target_folder, conversation_history):
         print("Input cannot be empty.")
         return True
 
-    if route == "terminal":
-        if not payload:
-            print("Terminal task cannot be empty after '#'.")
+    try:
+        if route == "terminal":
+            if not payload:
+                print("Terminal task cannot be empty after '#'.")
+                return True
+            print(f"Target folder: {target_folder}")
+            print("Routing task to terminal automation.")
+            run_terminal_task(payload, target_folder=target_folder)
             return True
-        print(f"Target folder: {target_folder}")
-        print("Routing task to terminal automation.")
-        run_terminal_task(payload, target_folder=target_folder)
-        return True
 
-    if route == "coding":
-        if not payload:
-            print("Coding task cannot be empty after '!'.")
+        if route == "coding":
+            if not payload:
+                print("Coding task cannot be empty after '!'.")
+                return True
+            run_coding_agent_pipeline(target_folder, payload)
             return True
-        run_coding_agent_pipeline(target_folder, payload)
-        return True
 
-    run_chat_pipeline(payload, conversation_history)
+        run_chat_pipeline(payload, conversation_history)
+    except RuntimeError as error:
+        message = str(error).strip() or "An unexpected error occurred."
+        print(message)
     return True
 
 
@@ -389,51 +398,30 @@ def build_document_id(file_entry):
     return f'{file_entry["name"]}-{digest}'
 
 
-def generate_embeddings(documents, model_name=None):
-    """Generate embeddings for a list of documents using the active backend."""
-    provider = get_llm_provider()
-    resolved_model = resolve_embedding_model(model_name)
-
-    try:
-        response = embed_with_status(
-            "Embedding",
-            model=resolved_model,
-            input=documents,
-        )
-    except Exception as error:
-        if provider == "openrouter":
-            raise RuntimeError(
-                f"Could not generate embeddings with OpenRouter model "
-                f"'{resolved_model}'. Make sure OPENROUTER_API_KEY is set and "
-                "OPENROUTER_EMBED_MODEL points to an embedding-capable model, "
-                "for example `openai/text-embedding-3-small`. "
-                f"Original error: {error}"
-            ) from error
-
-        raise RuntimeError(
-            f"Could not generate embeddings with Ollama model '{resolved_model}'. "
-            "Make sure Ollama is running and the embedding model is available. "
-            f"For example: `ollama pull {resolved_model}`. "
-            f"Original error: {error}"
-        ) from error
-
-    return response["embeddings"]
-
-
 def store_json_data_in_chromadb(
     data,
     db_path=CHROMA_DB_PATH,
-    collection_name=COLLECTION_NAME,
-    embed_model=None,
+    collection_name=None,
 ):
-    """Store each JSON object as a separate document in ChromaDB."""
+    """Store each JSON object as a separate document in ChromaDB.
+
+    ChromaDB generates embeddings internally using its default embedding
+    function, so no provider-specific embedding model is needed here.
+    """
     if not data:
         print("No data found to store in ChromaDB.")
         return
 
     os.makedirs(db_path, exist_ok=True)
+    resolved_collection_name = resolve_chroma_collection_name(
+        collection_name=collection_name
+    )
+
     client = chromadb.PersistentClient(path=db_path)
-    collection = client.get_or_create_collection(name=collection_name)
+    collection = client.get_or_create_collection(
+        name=resolved_collection_name,
+        embedding_function=embedding_functions.DefaultEmbeddingFunction(),
+    )
 
     documents = [item["content"] for item in data]
     metadatas = [
@@ -442,22 +430,22 @@ def store_json_data_in_chromadb(
             "source": item["name"],
             "content_length": len(item["content"]),
             "priority": float(item.get("flag", 0.0)),
+            "embedding_provider": "chroma",
+            "embedding_model": "default",
         }
         for item in data
     ]
     ids = [build_document_id(item) for item in data]
-    embeddings = generate_embeddings(documents, model_name=embed_model)
 
     collection.upsert(
         ids=ids,
         documents=documents,
         metadatas=metadatas,
-        embeddings=embeddings,
     )
 
     print(
         f"Stored {len(data)} JSON entries in ChromaDB collection "
-        f"'{collection_name}' at '{db_path}'."
+        f"'{resolved_collection_name}' at '{db_path}'."
     )
 
 
