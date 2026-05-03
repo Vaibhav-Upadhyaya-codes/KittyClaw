@@ -12,12 +12,12 @@ Run one of these commands to install Kitty Claw:
 
 **For macOS/Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-repo/kittyclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Vaibhav-Upadhyaya-codes/KittyClaw/deploy/install.sh | bash
 ```
 
 **For Windows:**
 ```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Vaibhav-Upadhyaya-codes/KittyClaw/deploy/install.ps1 | iex"
 ```
 
 ### Manual Install
@@ -121,6 +121,6 @@ Apache-2.0
 
 ## Support
 
-- Report bugs: [GitHub Issues](https://github.com/your-repo/kittyclaw/issues)
-- Documentation: [Wiki](https://github.com/your-repo/kittyclaw/wiki)
-- Community: [Discussions](https://github.com/your-repo/kittyclaw/discussions)
+- Report bugs: [GitHub Issues](https://github.com/Vaibhav-Upadhyaya-codes/KittyClaw/issues)
+- Documentation: [Wiki](https://github.com/Vaibhav-Upadhyaya-codes/KittyClaw/wiki)
+- Community: [Discussions](https://github.com/Vaibhav-Upadhyaya-codes/KittyClaw/discussions)
