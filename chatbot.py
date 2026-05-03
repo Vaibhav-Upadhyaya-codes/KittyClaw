@@ -42,11 +42,39 @@ OPENROUTER_MODEL = os.environ.get(
     os.environ.get("ANTHROPIC_MODEL", "openrouter/free"),
 )
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Ensure OpenRouter API key is available. Prompt on first run and store it in ~/.kittyclaw/.env.
+config_dir = os.path.join(os.path.expanduser("~"), ".kittyclaw")
+env_path = os.path.join(config_dir, ".env")
+
+def _load_api_key():
+    # Load from .env if present
+    if os.path.isfile(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("OPENROUTER_API_KEY="):
+                    key = line.split("=", 1)[1]
+                    os.environ["OPENROUTER_API_KEY"] = key
+                    return key
+    # Prompt user
+    print("\n=== Kitty Claw Setup ===")
+    while True:
+        key = input("Enter your OpenRouter API key (starts with 'sk-'): ").strip()
+        if key.lower().startswith("sk-") and len(key) > 10:
+            break
+        print("Invalid format. Please try again.")
+    # Save to .env
+    os.makedirs(config_dir, exist_ok=True)
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write(f"OPENROUTER_API_KEY={key}\n")
+    os.environ["OPENROUTER_API_KEY"] = key
+    return key
+
 OPENROUTER_API_KEY = (
     os.environ.get("OPENROUTER_API_KEY")
     or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     or os.environ.get("ANTHROPIC_API_KEY")
-    or "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"
+    or _load_api_key()
 )
 OPENROUTER_UNAVAILABLE_MESSAGE = "Currntly unavailable"
 
