@@ -1,11 +1,469 @@
 import json
 import os
+import requests
 import subprocess
+import threading
+import time
+import itertools
+import sys
 import ollama
+from chromadb.utils import embedding_functions
 
-MODEL = "qwen3.5:397b-cloud"
+
+def _load_claude_env():
+    """Load env vars from Claude Code settings.json if not already set."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, ".claude", "settings.json"),
+        os.path.join(base, ".claude", "settings.local.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.json"),
+        os.path.join(os.path.expanduser("~"), ".claude", "settings.local.json"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            env = data.get("env", {})
+            for k, v in env.items():
+                if k not in os.environ:
+                    os.environ[k] = v
+            break
+        except Exception:
+            continue
+
+
+_load_claude_env()
+
+MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL",
+    os.environ.get("ANTHROPIC_MODEL", "openrouter/free"),
+)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY = (
+    os.environ.get("OPENROUTER_API_KEY")
+    or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    or os.environ.get("ANTHROPIC_API_KEY")
+    or "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"
+)
+OPENROUTER_UNAVAILABLE_MESSAGE = "Currntly unavailable"
+
+def normalize_openrouter_model(model):
+    """Convert generic free‑model aliases to real OpenRouter model IDs."""
+    if not model:
+        return "openrouter/free"
+    # Strip the "openrouter/" prefix that Claude Code uses
+    if model.startswith("openrouter/"):
+        model = model[len("openrouter/"):]
+    # If the alias is just "free", pick a concrete free model
+    if model == "free":
+        model = "openrouter/free"
+    return model
+LLM_PROVIDER_ENV = "SOFTMOTHER_LLM_PROVIDER"
+ACTIVE_LLM_PROVIDER = None
 FILE_CONTEXT_JSON = "fileContent.json"
 PLAN_OUTPUT_JSON = "plan.json"
+DEFAULT_CHROMA_COLLECTION = "file_contents"
+ACCENT = "\033[38;2;50;205;194m"
+BG = "\033[48;2;11;16;32m"
+RESET = "\033[0m"
+THINKING_FRAMES = (
+    "✚",
+    "✢",
+    "✣",
+    "✤",
+    "✥",
+    "✦",
+    "✧",
+    "✜",
+    "✛",
+    "✖",
+    "✚",
+)
+
+
+def _prepare_terminal_output():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _clear_status_line(label):
+    width = max(40, len(label) + 12)
+    sys.stdout.write("\r" + (" " * width) + "\r")
+    sys.stdout.flush()
+
+
+def _thinking_loop(label, stop_event):
+    frames = itertools.cycle(THINKING_FRAMES)
+    while not stop_event.is_set():
+        symbol = next(frames)
+        sys.stdout.write(f"\r{BG}{ACCENT}{label} {symbol}{RESET}")
+        sys.stdout.flush()
+        if stop_event.wait(0.11):
+            break
+    _clear_status_line(label)
+
+
+def run_with_thinking(label, func, *args, **kwargs):
+    _prepare_terminal_output()
+
+    if not getattr(sys.stdout, "isatty", lambda: False)():
+        return func(*args, **kwargs)
+
+    stop_event = threading.Event()
+    animation = threading.Thread(
+        target=_thinking_loop,
+        args=(label, stop_event),
+        daemon=True,
+    )
+    animation.start()
+
+    try:
+        return func(*args, **kwargs)
+    finally:
+        stop_event.set()
+        animation.join(timeout=1.0)
+        _clear_status_line(label)
+
+
+def normalize_llm_provider(provider):
+    """Normalize accepted backend names to 'openrouter' or 'ollama'."""
+    normalized = str(provider or "").strip().lower()
+    aliases = {
+        "1": "openrouter",
+        "openrouter": "openrouter",
+        "open route": "openrouter",
+        "openroute": "openrouter",
+        "cloud": "openrouter",
+        "2": "ollama",
+        "ollama": "ollama",
+        "local": "ollama",
+    }
+    return aliases.get(normalized)
+
+
+def set_llm_provider(provider):
+    """Persist the selected LLM backend for the current process."""
+    global ACTIVE_LLM_PROVIDER
+
+    normalized = normalize_llm_provider(provider)
+    if normalized not in {"openrouter", "ollama"}:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
+
+    ACTIVE_LLM_PROVIDER = normalized
+    os.environ[LLM_PROVIDER_ENV] = normalized
+    return normalized
+
+
+def choose_llm_provider(preferred=None, prompt_user=True):
+    """Select the LLM backend once, prompting the user when needed."""
+    global ACTIVE_LLM_PROVIDER
+
+    if ACTIVE_LLM_PROVIDER:
+        return ACTIVE_LLM_PROVIDER
+
+    preset = normalize_llm_provider(preferred) or normalize_llm_provider(
+        os.environ.get(LLM_PROVIDER_ENV)
+    )
+    if preset:
+        return set_llm_provider(preset)
+
+    if not prompt_user or not getattr(sys.stdin, "isatty", lambda: False)():
+        return set_llm_provider("ollama")
+
+    print("\nChoose the LLM backend:")
+    print("1. OpenRouter (cloud)")
+    print("2. Ollama (local)")
+
+    while True:
+        choice = input("Select backend [1/2]: ").strip()
+        normalized = normalize_llm_provider(choice)
+        if normalized:
+            return set_llm_provider(normalized)
+        print("Please choose 1 for OpenRouter or 2 for Ollama.")
+
+
+def get_llm_provider():
+    """Return the active LLM backend, prompting once if necessary."""
+    return choose_llm_provider()
+
+
+def resolve_chat_model(requested_model=None):
+    """Map chat prompts to the active backend's model."""
+    if get_llm_provider() == "openrouter":
+        return normalize_openrouter_model(OPENROUTER_MODEL)
+    return requested_model or MODEL
+
+
+def get_chroma_embedding_function():
+    """Return ChromaDB's built-in/default embedding function."""
+    return embedding_functions.DefaultEmbeddingFunction()
+
+
+def resolve_chroma_collection_name(collection_name=None, model_name=None, provider=None):
+    """Return the shared ChromaDB collection name used for file storage."""
+    if collection_name:
+        return collection_name
+    return DEFAULT_CHROMA_COLLECTION
+
+
+def raise_for_openrouter_response(response):
+    """Raise a friendly message for OpenRouter rate limiting."""
+    if response.status_code == 429:
+        raise RuntimeError(OPENROUTER_UNAVAILABLE_MESSAGE)
+    response.raise_for_status()
+
+
+def _extract_openrouter_delta(payload):
+    """Extract streamed token text from an OpenRouter SSE chunk."""
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, list):
+            parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            return "".join(parts)
+        if content:
+            return str(content)
+
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+        return "".join(parts)
+    if content:
+        return str(content)
+
+    return ""
+
+
+def openrouter_chat(model=None, messages=None, **kwargs):
+    """Call OpenRouter's chat completions API and return an Ollama-like shape."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+        )
+
+    payload = {
+        "model": resolve_chat_model(model),
+        "messages": messages or [],
+        "stream": True,
+    }
+
+    for key, value in kwargs.items():
+        if key == "stream" or value is None:
+            continue
+        payload[key] = value
+
+    response = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://softmother.local",
+            "X-Title": "KittyClaw",
+        },
+        json=payload,
+        stream=True,
+        timeout=300,
+    )
+    if response.status_code != 200:
+        try:
+            err = response.json()
+        except Exception:
+            err = response.text[:200]
+        raise RuntimeError(
+            f"OpenRouter error {response.status_code}: {err}"
+        )
+    raise_for_openrouter_response(response)
+
+    reply = ""
+    for chunk in response.iter_lines():
+        if not chunk:
+            continue
+
+        data = chunk.decode("utf-8")
+        if not data.startswith("data: "):
+            continue
+
+        body = data[6:]
+        if body.strip() == "[DONE]":
+            break
+
+        try:
+            payload_chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+        reply += _extract_openrouter_delta(payload_chunk)
+
+    return {"message": {"content": reply}}
+
+# ----- Safe wrapper with retries -----
+def safe_openrouter_chat(retries: int = 3, backoff: float = 1.0, **kwargs):
+    """Call OpenRouter with simple retry logic.
+    Retries on the custom UNAVAILABLE message. If all attempts fail, falls back to Ollama.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return openrouter_chat(**kwargs)
+        except RuntimeError as e:
+            # Detect our custom unavailable message
+            if OPENROUTER_UNAVAILABLE_MESSAGE.lower() in str(e).lower():
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+                    continue
+                # final attempt failed – fall back to Ollama
+                kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+                return ollama.chat(**kwargs)
+            # any other error propagates
+            raise
+    # Should never reach here
+    raise RuntimeError("OpenRouter failed after retries")
+
+
+def safe_stream_openrouter_chat(retries: int = 3, backoff: float = 1.0, **kwargs):
+    """Stream from OpenRouter with retry logic.
+    Retries on unavailable model errors. Falls back to Ollama streaming if all attempts fail.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            gen = _stream_openrouter_chat(**kwargs)
+            for chunk in gen:
+                yield chunk
+            return
+        except RuntimeError as e:
+            if OPENROUTER_UNAVAILABLE_MESSAGE.lower() in str(e).lower():
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+                    continue
+                # final attempt failed – fall back to Ollama streaming
+                kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+                kwargs["stream"] = True
+                for chunk in ollama.chat(**kwargs):
+                    text = _extract_ollama_stream_chunk(chunk)
+                    if text:
+                        yield text
+                return
+            raise
+
+
+def _stream_openrouter_chat(model=None, messages=None, **kwargs):
+    """Yield streamed text chunks from OpenRouter chat completions."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OpenRouter is selected but OPENROUTER_API_KEY is not configured."
+        )
+
+    model_id = resolve_chat_model(model)
+    payload = {
+        "model": model_id,
+        "messages": messages or [],
+        "stream": True,
+    }
+
+    for key, value in kwargs.items():
+        if key == "stream" or value is None:
+            continue
+        payload[key] = value
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://softmother.local",
+        "X-Title": "KittyClaw",
+    }
+
+    response = requests.post(
+        OPENROUTER_URL,
+        headers=headers,
+        json=payload,
+        stream=True,
+        timeout=300,
+    )
+
+    if response.status_code != 200:
+        try:
+            err_body = response.json()
+        except Exception:
+            err_body = response.text[:500]
+        raise RuntimeError(
+            f"OpenRouter {response.status_code}: "
+            f"model={model_id} | key={OPENROUTER_API_KEY[:10]}... | {err_body}"
+        )
+
+    raise_for_openrouter_response(response)
+
+    for chunk in response.iter_lines():
+        if not chunk:
+            continue
+
+        data = chunk.decode("utf-8")
+        if not data.startswith("data: "):
+            continue
+
+        body = data[6:]
+        if body.strip() == "[DONE]":
+            break
+
+        try:
+            payload_chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+
+        text = _extract_openrouter_delta(payload_chunk)
+        if text:
+            yield text
+
+
+def _extract_ollama_stream_chunk(chunk):
+    """Extract streamed token text from an Ollama chat chunk."""
+    if isinstance(chunk, dict):
+        message = chunk.get("message") or {}
+        return str(message.get("content") or "")
+
+    message = getattr(chunk, "message", None)
+    if message is not None:
+        content = getattr(message, "content", "")
+        if content:
+            return str(content)
+
+    return ""
+
+
+def llm_chat(**kwargs):
+    """Dispatch chat prompts to the selected backend with retry handling for OpenRouter."""
+    if get_llm_provider() == "openrouter":
+        return safe_openrouter_chat(**kwargs)
+    kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+    return ollama.chat(**kwargs)
+
+
+def ollama_chat_with_status(label, **kwargs):
+    return run_with_thinking(label, llm_chat, **kwargs)
+
+
+def stream_llm_chat(**kwargs):
+    """Yield streamed text chunks from the selected chat backend with retries for OpenRouter."""
+    if get_llm_provider() == "openrouter":
+        yield from safe_stream_openrouter_chat(**kwargs)
+        return
+
+    kwargs["model"] = resolve_chat_model(kwargs.get("model"))
+    kwargs["stream"] = True
+    for chunk in ollama.chat(**kwargs):
+        text = _extract_ollama_stream_chunk(chunk)
+        if text:
+            yield text
 
 
 def load_file_context(json_path=FILE_CONTEXT_JSON, threshold=0.5):
@@ -137,7 +595,8 @@ def planner(task, file_entry):
     file_name = file_entry.get("name", "unknown")
     file_notes = file_entry.get("notes", "")
 
-    response = ollama.chat(
+    response = ollama_chat_with_status(
+        "Planning",
         model=MODEL,
         messages=[
             {
@@ -187,7 +646,8 @@ def refinedTask(task, file_entry):
     file_name = file_entry.get("name", "unknown")
     file_notes = file_entry.get("notes", "")
 
-    response = ollama.chat(
+    response = ollama_chat_with_status(
+        "Refining task",
         model=MODEL,
         messages=[
             {
@@ -235,7 +695,8 @@ def validate_plan_against_task(task_given, refined_task, step):
         return 0.0
 
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Validating",
             model=MODEL,
             messages=[
                 {
@@ -374,7 +835,7 @@ def get_file_content_from_chromadb(file_name, db_path=None, collection_name=None
     Args:
         file_name: Name of the file to retrieve
         db_path: Path to ChromaDB (defaults to CHROMA_DB_PATH from main.py)
-        collection_name: Collection name (defaults to COLLECTION_NAME)
+        collection_name: Collection name (defaults to file_contents)
 
     Returns:
         dict with file content and metadata, or None if not found
@@ -384,27 +845,39 @@ def get_file_content_from_chromadb(file_name, db_path=None, collection_name=None
 
     DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
     db_path = db_path or os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
-    collection_name = collection_name or "file_contents"
+    resolved_collection_name = resolve_chroma_collection_name(
+        collection_name=collection_name
+    )
+    collection_names = [resolved_collection_name]
 
     try:
         client = chromadb.PersistentClient(path=db_path)
-        collection = client.get_collection(name=collection_name)
+        for candidate in collection_names:
+            try:
+                collection = client.get_collection(
+                    name=candidate,
+                    embedding_function=get_chroma_embedding_function(),
+                )
+            except Exception:
+                continue
 
-        # Query by metadata (file name)
-        results = collection.get(
-            where={"name": file_name},
-            include=["documents", "metadatas"]
+            results = collection.get(
+                where={"name": file_name},
+                include=["documents", "metadatas"]
+            )
+
+            if results["ids"] and len(results["ids"]) > 0:
+                return {
+                    "file_name": file_name,
+                    "content": results["documents"][0],
+                    "metadata": results["metadatas"][0] if results["metadatas"] else {},
+                }
+
+        print(
+            f"File '{file_name}' not found in ChromaDB collections: "
+            f"{', '.join(collection_names)}."
         )
-
-        if results["ids"] and len(results["ids"]) > 0:
-            return {
-                "file_name": file_name,
-                "content": results["documents"][0],
-                "metadata": results["metadatas"][0] if results["metadatas"] else {},
-            }
-        else:
-            print(f"File '{file_name}' not found in ChromaDB.")
-            return None
+        return None
 
     except Exception as error:
         print(f"Error retrieving file from ChromaDB: {error}")
@@ -419,7 +892,8 @@ def apply_file_edit(file_path, current_content, step_description):
         step_description: Description of what change to make
     """
     try:
-        response = ollama.chat(
+        response = ollama_chat_with_status(
+            "Fixing code",
             model='qwen3.5:397b-cloud',
             messages=[
                 {
@@ -472,12 +946,6 @@ def implementing_changes(content, step, path):
         path: Full path to the file
     """
     apply_file_edit(path, content, step)
-
-import ollama
-import sys
-import time
-import itertools
-
 
 def stream_clean_response(response):
     """

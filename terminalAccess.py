@@ -1,123 +1,349 @@
-from time import sleep, time
-
-import ollama
+import argparse
+import atexit
 import json
-import subprocess
 import os
+import re
+import subprocess
 
-JSON_FILE = 'instance.json'
+from chatbot import (
+    apply_file_edit,
+    choose_llm_provider,
+    extract_json_text,
+    normalize_plan,
+    ollama_chat_with_status,
+)
 
-# Global persistent PowerShell session
+MODEL = "qwen3.5:397b-cloud"
+JSON_FILE = "instance.json"
+TERMINAL_PLAN_FILE = "terminal_plan.json"
+DEFAULT_MAX_ITERATIONS = 20
+MAX_PROJECT_FILES_IN_PROMPT = 200
+
 _ps_process = None
+CMDLET_PATTERN = re.compile(r"^[A-Za-z]+-[A-Za-z]+$")
+PATH_PREFIX_PATTERN = re.compile(r"^(?:[A-Za-z]:\\|\.\\|\.\/|\\)")
+KNOWN_NATIVE_COMMANDS = {
+    "python",
+    "py",
+    "pip",
+    "pip3",
+    "git",
+    "npm",
+    "npx",
+    "node",
+    "uv",
+    "pytest",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "dir",
+    "ls",
+    "mkdir",
+    "rmdir",
+    "copy",
+    "move",
+    "ren",
+    "del",
+    "type",
+    "echo",
+    "where",
+}
+POWERSHELL_KEYWORDS = {
+    "if",
+    "elseif",
+    "else",
+    "foreach",
+    "for",
+    "while",
+    "switch",
+    "try",
+    "catch",
+    "finally",
+    "function",
+    "filter",
+    "return",
+    "param",
+}
+NARRATION_MARKERS = (
+    "\\boxed{",
+    "final answer",
+    "final decision",
+    "however, adhering",
+    "here's the final choice",
+    "using the previous error",
+    "wait but maybe",
+    "considering the user wants",
+    "the safest answer",
+    "the correct, minimal",
+    "ultimately,",
+)
 
-def get_persistent_powershell():
-    """Get or create a persistent PowerShell process"""
+
+def _escape_powershell_single_quotes(value):
+    """Escape single quotes for PowerShell single-quoted strings."""
+    return str(value).replace("'", "''")
+
+
+def close_persistent_powershell():
+    """Close the persistent PowerShell process if it exists."""
     global _ps_process
+
+    if _ps_process is None:
+        return
+
+    try:
+        if _ps_process.stdin:
+            _ps_process.stdin.write("exit\n")
+            _ps_process.stdin.flush()
+        _ps_process.wait(timeout=5)
+    except Exception:
+        try:
+            _ps_process.kill()
+        except Exception:
+            pass
+    finally:
+        _ps_process = None
+
+
+atexit.register(close_persistent_powershell)
+
+
+def get_persistent_powershell(working_directory=None):
+    """Get or create a persistent PowerShell process."""
+    global _ps_process
+
     if _ps_process is None:
         _ps_process = subprocess.Popen(
-            ['powershell', '-NoExit', '-Command', '-'],
+            ["powershell", "-NoLogo", "-NoExit", "-Command", "-"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            cwd=working_directory or os.getcwd(),
         )
+
     return _ps_process
 
-def tyyping_effect(text):
-    """Simulate typing effect in terminal"""
-    for char in text:
-        print(char, end='', flush=True)
-        sleep(0.02)  # Adjust typing speed here
-    print()  # New line after finishing
 
 def load_json_data():
-    """Load existing data from JSON file or create empty list"""
+    """Load existing command history from JSON file."""
     if os.path.exists(JSON_FILE) and os.path.getsize(JSON_FILE) > 0:
-        with open(JSON_FILE, 'r') as f:
-            return json.load(f)
+        with open(JSON_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
     return []
 
+
+def reset_json_data():
+    """Start a fresh command history for a new terminal task."""
+    with open(JSON_FILE, "w", encoding="utf-8") as file:
+        json.dump([], file, indent=2)
+
+
 def save_to_json(command, result):
-    """Save command and result to JSON file"""
+    """Save command execution details to JSON file."""
     data = load_json_data()
-    data.append({
-        'command': command,
-        'result': result
-    })
-    with open(JSON_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-def generate_command(task):
-    stream = ollama.chat(
-        model='qwen3.5:397b-cloud',
-        messages=[{'role':'user','content':f'''you are a powershell command writer
-                   -write powershell command as per the task given
-                   -you will be given context history of the commands that have been executed and there output
-                   -only return one command at a time 
-                   -if the task is complete return TASK COMPLETE
-                   
-                   task: {task}
-                   context history: {json.dumps(load_json_data())}
-                   '''
-                   }],
-        stream=True
+    data.append(
+        {
+            "command": command,
+            "result": result,
+        }
     )
-    return stream
+    with open(JSON_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
 
-def extract_command(command):
-    stream = ollama.chat(
-        model='qwen3.5:397b-cloud',
-        messages=[{'role':'user','content':f'extract powershell command from the following text: {command}, only return the command without any explanation'}],
-        stream=True
+
+def save_action_to_json(action, result):
+    """Save a structured terminal action and its result to JSON file."""
+    data = load_json_data()
+    data.append(
+        {
+            "action": action,
+            "result": result,
+        }
     )
-    return stream
+    with open(JSON_FILE, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2, ensure_ascii=False)
 
-def clean_command(cmd):
-    """Clean and validate the command"""
-    # Strip whitespace
-    cmd = cmd.strip()
-    
-    # Remove leading/trailing quotes if present
-    if (cmd.startswith('"') and cmd.endswith('"')) or (cmd.startswith("'") and cmd.endswith("'")):
-        cmd = cmd[1:-1]
-    
-    # Remove common LLM artifacts
-    if cmd.lower().startswith("powershell"):
-        cmd = cmd[len("powershell"):].strip()
-    if cmd.lower().startswith("-command"):
-        cmd = cmd[len("-command"):].strip()
-    
-    return cmd.strip()
 
-def is_valid_command(cmd):
-    """Check if command looks valid (basic validation)"""
-    if not cmd or len(cmd) < 2:
+def save_terminal_plan(task, plan, output_path=TERMINAL_PLAN_FILE):
+    """Persist the generated terminal plan."""
+    payload = {
+        "task": task,
+        "plan": plan,
+    }
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
+
+
+def print_terminal_plan(task, plan):
+    """Print the terminal execution plan in a readable format."""
+    print("\n" + "=" * 80)
+    print("TERMINAL EXECUTION PLAN")
+    print("=" * 80)
+    print(f"Task: {task}")
+
+    if not plan:
+        print("No plan steps were generated.")
+        print("=" * 80)
+        return
+
+    for index, item in enumerate(plan, start=1):
+        tools = ", ".join(item.get("tools", [])) or "PowerShell"
+        print(f"\n[{index}] {item.get('step', '').strip()}")
+        print(f"Tools: {tools}")
+
+    print("=" * 80)
+
+
+def default_terminal_plan():
+    """Return a safe fallback plan when the model does not return valid JSON."""
+    return [
+        {
+            "step": "Inspect the working directory and identify the exact target path.",
+            "tools": ["powershell"],
+        },
+        {
+            "step": "Apply the requested filesystem or command changes.",
+            "tools": ["powershell"],
+        },
+        {
+            "step": "Verify the requested result exists and matches the task.",
+            "tools": ["powershell"],
+        },
+    ]
+
+
+def clean_command(command):
+    """Clean and normalize a model-generated PowerShell command."""
+    cleaned = str(command or "").strip()
+
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    if (
+        cleaned.startswith('"') and cleaned.endswith('"')
+    ) or (
+        cleaned.startswith("'") and cleaned.endswith("'")
+    ):
+        cleaned = cleaned[1:-1].strip()
+
+    lowered = cleaned.lower()
+    if lowered.startswith("powershell"):
+        cleaned = cleaned[len("powershell"):].strip()
+        lowered = cleaned.lower()
+
+    if lowered.startswith("-command"):
+        cleaned = cleaned[len("-command"):].strip()
+
+    return cleaned.strip()
+
+
+def _line_starts_like_command(line):
+    """Heuristically validate that each line starts like PowerShell/code, not prose."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+
+    if stripped.startswith(("#", "$", "[", "(", "{", "@")):
+        return True
+
+    first_token = stripped.split()[0].rstrip(";")
+    normalized_token = first_token.lower()
+
+    if normalized_token in POWERSHELL_KEYWORDS:
+        return True
+
+    if CMDLET_PATTERN.match(first_token):
+        return True
+
+    if PATH_PREFIX_PATTERN.match(first_token):
+        return True
+
+    if normalized_token in KNOWN_NATIVE_COMMANDS:
+        return True
+
+    return False
+
+
+def contains_narration(command):
+    """Reject model chatter that slips past basic quote validation."""
+    lowered = command.lower()
+    if any(marker in lowered for marker in NARRATION_MARKERS):
+        return True
+
+    return '"command"' in lowered or '"complete"' in lowered
+
+
+def is_valid_command(command):
+    """Basic validation for generated commands."""
+    if not command or len(command) < 2:
         return False
-    
-    # Check for unmatched quotes
-    single_quotes = cmd.count("'") - cmd.count("\\'")
-    double_quotes = cmd.count('"') - cmd.count('\\"')
-    
-    # Quotes should be even (matched pairs)
+
+    if command == "TASK COMPLETE":
+        return True
+
+    single_quotes = command.count("'") - command.count("\\'")
+    double_quotes = command.count('"') - command.count('\\"')
+
     if single_quotes % 2 != 0 or double_quotes % 2 != 0:
         return False
-    
-    return True
 
-def execute_powershell_command(command):
-    """Execute PowerShell command in persistent session and return output"""
+    if contains_narration(command):
+        return False
+
+    lines = [line for line in command.splitlines() if line.strip()]
+    if len(lines) > 12:
+        return False
+
+    return all(_line_starts_like_command(line) for line in lines)
+
+
+def parse_command_response(raw_text):
+    """Parse a structured model response into a command or TASK COMPLETE."""
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+
+    json_text = extract_json_text(text)
     try:
-        ps = get_persistent_powershell()
-        
-        # Send command and a marker to know when it's done
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return clean_command(text)
+
+    if isinstance(parsed, dict):
+        if parsed.get("complete") is True:
+            return "TASK COMPLETE"
+        return clean_command(parsed.get("command", ""))
+
+    return clean_command(text)
+
+
+def execute_powershell_command(command, working_directory=None):
+    """Execute a PowerShell command in the persistent session and return output."""
+    try:
+        ps = get_persistent_powershell(working_directory=working_directory)
         marker = "<<<END_OF_COMMAND_OUTPUT>>>"
-        full_command = f"{command}; Write-Host '{marker}'\n"
-        
+        if working_directory:
+            escaped_path = _escape_powershell_single_quotes(
+                os.path.abspath(working_directory)
+            )
+            full_command = (
+                f"Set-Location -LiteralPath '{escaped_path}'; "
+                f"{command}; "
+                f"Write-Host '{marker}'\n"
+            )
+        else:
+            full_command = f"{command}; Write-Host '{marker}'\n"
+
         ps.stdin.write(full_command)
         ps.stdin.flush()
-        
-        # Read output until we see the marker
+
         output = ""
         while True:
             char = ps.stdout.read(1)
@@ -125,56 +351,386 @@ def execute_powershell_command(command):
                 break
             output += char
             if marker in output:
-                # Remove the marker and everything after it
                 output = output.split(marker)[0]
                 break
-        
+
         return output.strip()
-    except Exception as e:
-        return f"Error executing command: {str(e)}"
+    except Exception as error:
+        return f"Error executing command: {error}"
 
-while True:
-    think = generate_command(r"C:\Users\Vaibhav Upadhyaya\OneDrive\Documents\MASTER\terminalAi\test.py  go to this file and read its content it has a error fix that error plaese ")
-    
-    # Extract command from think stream
-    think_output = ""
-    for chunk in think:
-        think_output += chunk['message']['content']
-    
-    if "TASK COMPLETE" in think_output:
-        tyyping_effect("Task completed")
-        # Clean up PowerShell session
-        if _ps_process:
-            _ps_process.stdin.write("exit\n")
-            _ps_process.stdin.flush()
-            _ps_process.wait()
-            _ps_process = None
-        break
-    
-    command_stream = extract_command(think_output)
 
-    output = ""
-    for chunk in command_stream:
-        output += chunk['message']['content']
-        tyyping_effect(chunk['message']['content'])
-    
-    # Clean the command
-    output = clean_command(output)
-    output = output.replace('`', '').replace('powershell', '')
-    
-    print(f"\n[Executing command]: {output}\n")
-    
-    # Validate command before executing
-    if not is_valid_command(output):
-        tyyping_effect("[ERROR] Invalid command - skipping execution\n")
-        continue
-    
-    # Execute the command and get result
-    result = execute_powershell_command(output)
-    
-    tyyping_effect(f"\n--- Command Output ---\n{result}\n")
-    # Save command and result to JSON file
-    save_to_json(output, result)
-    
-    tyyping_effect(f"\n--- Command saved to JSON ---\n")
+def generate_terminal_plan(task):
+    """Generate a step-by-step plan for a terminal automation task."""
+    response = ollama_chat_with_status(
+        "Planning terminal task",
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a planner for a terminal automation agent. "
+                    "Return only valid JSON. "
+                    "The JSON must be an array. "
+                    "Each array item must have exactly these keys: "
+                    '"step" and "tools". '
+                    '"step" must be a concise, concrete action. '
+                    '"tools" must be an array of strings. '
+                    "If a step requires creating or editing file contents, the step must mention the exact relative file path when known "
+                    'and the tools should include "llm" and "file_handling". '
+                    'Use "powershell" in tools for shell commands, inspection, setup, and verification. '
+                    "Keep the plan strict to the user's request. "
+                    "Do not include markdown fences or any explanation outside JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Create a terminal-first execution plan for the following task.\n\n"
+                    f"Task: {task}\n\n"
+                    "The plan should help an automated PowerShell agent complete the task safely, "
+                    "one command at a time."
+                ),
+            },
+        ],
+    )
 
+    raw_text = response["message"]["content"]
+    json_text = extract_json_text(raw_text)
+
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return default_terminal_plan()
+
+    normalized = normalize_plan(parsed)
+    return normalized or default_terminal_plan()
+
+
+def generate_command(task, plan, working_directory):
+    """Generate a single next PowerShell command for the task."""
+    history = load_json_data()
+    plan_text = json.dumps(plan, indent=2, ensure_ascii=False)
+    history_text = json.dumps(history, indent=2, ensure_ascii=False)
+
+    response = ollama_chat_with_status(
+        "Choosing terminal command",
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a PowerShell command writer. "
+                    "Return only valid JSON with exactly two keys: "
+                    '"command" and "complete". '
+                    'Example incomplete response: {"command":"Get-ChildItem","complete":false}. '
+                    'Example complete response: {"command":"","complete":true}. '
+                    "Do not include markdown, code fences, labels, prose, or explanations. "
+                    "Use the existing command history to avoid repeating failed work. "
+                    "Prefer inspecting files before changing them when needed. "
+                    "When a Windows path contains spaces, always wrap it in quotes."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task}\n\n"
+                    f"Working directory: {working_directory}\n\n"
+                    f"Plan:\n{plan_text}\n\n"
+                    f"Command history with results:\n{history_text}\n\n"
+                    "Return only the single best next PowerShell command inside the JSON schema. "
+                    "If the task is fully completed, set complete to true."
+                ),
+            },
+        ],
+    )
+
+    return parse_command_response(response["message"]["content"])
+
+
+def list_project_files(working_directory, max_files=MAX_PROJECT_FILES_IN_PROMPT):
+    """Return a compact list of project files to help the model target edits."""
+    ignored_dirs = {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        "dist",
+        "build",
+    }
+    collected = []
+
+    for root, dirs, files in os.walk(working_directory):
+        dirs[:] = [directory for directory in dirs if directory not in ignored_dirs]
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(full_path, working_directory)
+            collected.append(relative_path)
+            if len(collected) >= max_files:
+                return collected
+
+    return collected
+
+
+def clean_relative_path(path_text):
+    """Normalize a model-provided relative file path."""
+    cleaned = str(path_text or "").strip().strip('"').strip("'")
+    cleaned = cleaned.replace("/", os.sep).replace("\\", os.sep)
+    return os.path.normpath(cleaned)
+
+
+def resolve_action_file_path(working_directory, relative_path):
+    """Resolve a relative path and ensure it stays within the working directory."""
+    cleaned_relative_path = clean_relative_path(relative_path)
+    if not cleaned_relative_path or cleaned_relative_path in {".", os.pardir}:
+        raise ValueError("File edit action did not provide a valid relative file path.")
+
+    absolute_working_directory = os.path.abspath(working_directory)
+    resolved_path = os.path.abspath(
+        os.path.join(absolute_working_directory, cleaned_relative_path)
+    )
+
+    if os.path.commonpath([absolute_working_directory, resolved_path]) != absolute_working_directory:
+        raise ValueError(
+            f"Refusing to edit file outside the working directory: {cleaned_relative_path}"
+        )
+
+    return resolved_path, os.path.relpath(resolved_path, absolute_working_directory)
+
+
+def parse_terminal_action_response(raw_text):
+    """Parse a structured model response into a terminal action dict."""
+    text = str(raw_text or "").strip()
+    empty_action = {
+        "type": "",
+        "command": "",
+        "target_file": "",
+        "instruction": "",
+        "complete": False,
+    }
+    if not text:
+        return empty_action
+
+    json_text = extract_json_text(text)
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        return empty_action
+
+    if not isinstance(parsed, dict):
+        return empty_action
+
+    action_type = str(parsed.get("type", "")).strip().lower()
+    action = {
+        "type": action_type,
+        "command": clean_command(parsed.get("command", "")),
+        "target_file": clean_relative_path(parsed.get("target_file", "")),
+        "instruction": str(parsed.get("instruction", "")).strip(),
+        "complete": bool(parsed.get("complete", False)),
+    }
+    return action
+
+
+def is_valid_terminal_action(action):
+    """Validate the structured action returned by the terminal model."""
+    action_type = action.get("type", "")
+
+    if action.get("complete") is True:
+        return action_type in {"", "complete"}
+
+    if action_type == "powershell":
+        return is_valid_command(action.get("command", ""))
+
+    if action_type == "file_edit":
+        return bool(action.get("target_file")) and bool(action.get("instruction"))
+
+    return False
+
+
+def generate_next_action(task, plan, working_directory):
+    """Generate the next terminal action, allowing either shell or file editing."""
+    history = load_json_data()
+    plan_text = json.dumps(plan, indent=2, ensure_ascii=False)
+    history_text = json.dumps(history, indent=2, ensure_ascii=False)
+    project_files = list_project_files(working_directory)
+    files_text = json.dumps(project_files, indent=2, ensure_ascii=False)
+
+    response = ollama_chat_with_status(
+        "Choosing next action",
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an execution agent for a Windows terminal workflow. "
+                    "Return only valid JSON with exactly these keys: "
+                    '"type", "command", "target_file", "instruction", and "complete". '
+                    '"type" must be one of "powershell", "file_edit", or "complete". '
+                    'If "type" is "powershell", fill only "command" and set "complete" to false. '
+                    'If "type" is "file_edit", fill only "target_file" and "instruction" and set "complete" to false. '
+                    'If the task is done, set "type" to "complete" and "complete" to true. '
+                    "Do not include markdown, code fences, labels, prose, or explanations. "
+                    "Use file_edit when the next step requires writing or modifying code/text in a file. "
+                    "Use powershell for inspection, environment setup, package commands, git commands, or verification commands. "
+                    "When using file_edit, choose a relative file path from the provided project file list when possible."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task: {task}\n\n"
+                    f"Working directory: {working_directory}\n\n"
+                    f"Plan:\n{plan_text}\n\n"
+                    f"Project files:\n{files_text}\n\n"
+                    f"Action history with results:\n{history_text}\n\n"
+                    "Return only the single best next action inside the required JSON schema."
+                ),
+            },
+        ],
+    )
+
+    return parse_terminal_action_response(response["message"]["content"])
+
+
+def execute_file_edit_action(action, working_directory):
+    """Apply a model-directed file edit using the shared LLM file editor."""
+    target_file = action.get("target_file", "")
+    instruction = action.get("instruction", "")
+    resolved_path, relative_path = resolve_action_file_path(working_directory, target_file)
+
+    os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+
+    if os.path.exists(resolved_path):
+        with open(resolved_path, "r", encoding="utf-8") as file:
+            current_content = file.read()
+    else:
+        current_content = ""
+
+    print(f"[Editing] {relative_path}")
+    print(f"Instruction: {instruction}")
+    success = apply_file_edit(resolved_path, current_content, instruction)
+    if success:
+        return f"Updated file: {relative_path}"
+    return f"Failed to update file: {relative_path}"
+
+
+def normalize_terminal_task(task):
+    """Remove the routing prefix if the task starts with #."""
+    normalized = (task or "").strip()
+    if normalized.startswith("#"):
+        normalized = normalized[1:].strip()
+    return normalized
+
+
+def run_terminal_task(task, target_folder=None, max_iterations=DEFAULT_MAX_ITERATIONS):
+    """Run a terminal task using PowerShell commands and direct file edits."""
+    provider = choose_llm_provider()
+    working_directory = os.path.abspath(target_folder or os.getcwd())
+    normalized_task = normalize_terminal_task(task)
+
+    if not normalized_task:
+        print("Terminal task cannot be empty.")
+        return []
+
+    reset_json_data()
+    close_persistent_powershell()
+
+    plan = generate_terminal_plan(normalized_task)
+    save_terminal_plan(normalized_task, plan)
+    print_terminal_plan(normalized_task, plan)
+
+    print("\n" + "=" * 80)
+    print("STARTING TERMINAL AUTOMATION")
+    print("=" * 80)
+    print(f"LLM backend: {provider}")
+    print(f"Working directory: {working_directory}")
+
+    completed = False
+
+    try:
+        for iteration in range(1, max_iterations + 1):
+            print(f"\nIteration {iteration}/{max_iterations}")
+            action = generate_next_action(normalized_task, plan, working_directory)
+
+            if action.get("complete") is True or action.get("type") == "complete":
+                print("Task completed by terminal agent.")
+                completed = True
+                break
+
+            if not is_valid_terminal_action(action):
+                print(f"Invalid action generated: {action}")
+                save_action_to_json(action, "Skipped because the action was invalid.")
+                continue
+
+            if action["type"] == "powershell":
+                command = action.get("command", "")
+                print(f"[Executing] {command}")
+                result = execute_powershell_command(
+                    command,
+                    working_directory=working_directory,
+                )
+                print(result or "(no output)")
+                save_action_to_json(action, result)
+                continue
+
+            if action["type"] == "file_edit":
+                result = execute_file_edit_action(action, working_directory)
+                print(result)
+                save_action_to_json(action, result)
+                continue
+    finally:
+        close_persistent_powershell()
+
+    if not completed:
+        print(
+            f"Stopped after {max_iterations} iterations. "
+            "Review instance.json and terminal_plan.json for the last state."
+        )
+
+    return plan
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run a terminal-only task with planning and command execution."
+    )
+    parser.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        help="Task description. Prefixing with # is optional when calling terminalAccess directly.",
+    )
+    parser.add_argument(
+        "--target-folder",
+        default=None,
+        help="Working directory for the terminal agent. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+        help="Maximum number of commands the terminal agent may execute.",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="LLM backend to use: openrouter or ollama. If omitted, KittyClaw will ask at startup.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    choose_llm_provider(preferred=args.provider)
+    task = args.task or input("Enter terminal task: ").strip()
+    run_terminal_task(
+        task=task,
+        target_folder=args.target_folder,
+        max_iterations=args.max_iterations,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kittyclaw"
+version = "0.1.0"
+description = "Kitty Claw - AI-powered code rectification agent with a cute terminal mascot"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Vaibhav Upadhyaya", email = "vaibhav@example.com"}
+]
+requires-python = ">=3.8"
+dependencies = [
+    "ollama>=0.1.0",
+    "chromadb>=0.4.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+]
+
+[project.scripts]
+kittyclaw = "kitty_mascot:launch_tui"
+
+[tool.setuptools]
+py-modules = ["chatbot", "kitty_mascot", "main", "rectification", "terminalAccess"]
+
+[tool.setuptools.package-data]
+"*" = ["*.txt", "*.md"]

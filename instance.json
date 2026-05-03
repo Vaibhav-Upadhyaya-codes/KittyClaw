@@ -1,0 +1,10 @@
+[
+  {
+    "command": "python -m venv venv",
+    "result": ""
+  },
+  {
+    "command": "Test-Path venv",
+    "result": "True"
+  }
+]

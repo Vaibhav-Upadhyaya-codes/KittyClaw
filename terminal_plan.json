@@ -1,0 +1,17 @@
+{
+  "task": "create a virtual env",
+  "plan": [
+    {
+      "step": "Execute python -m venv venv to create the virtual environment",
+      "tools": [
+        "powershell"
+      ]
+    },
+    {
+      "step": "Verify the venv directory exists using Test-Path",
+      "tools": [
+        "powershell"
+      ]
+    }
+  ]
+}

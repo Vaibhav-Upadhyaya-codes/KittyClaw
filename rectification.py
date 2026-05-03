@@ -1,29 +1,37 @@
+import argparse
 import json
+import os
 from chatbot import implementing_changes, get_file_content_from_chromadb, validate_plan_against_task
-
-TARGET_FOLDER_PATH = r"C:\Users\Vaibhav Upadhyaya\OneDrive\Documents\MASTER\terminalAi"
 
 # Minimum relevance score for a step to be executed (0.0 to 1.0)
 # Steps below this threshold are skipped as they don't directly implement the task
 STEP_RELEVANCE_THRESHOLD = 0.7
 
 
-def rectification(TARGET_FOLDER_PATH, task_given):
+def resolve_target_folder(target_folder_path=None):
+    """Return the folder whose files should be modified."""
+    return os.path.abspath(target_folder_path or os.getcwd())
+
+
+def rectification(target_folder_path, task_given):
     """Execute the rectification pipeline strictly based on the user's original task.
 
     Only files and steps that directly contribute to the task are processed.
     Steps are validated against the task before execution.
 
     Args:
-        TARGET_FOLDER_PATH: Path to the target folder containing files to modify
+        target_folder_path: Path to the target folder containing files to modify
         task_given: The original user task that drives what changes should be made
     """
+    target_folder_path = resolve_target_folder(target_folder_path)
+
     with open("plan.json", "r") as f:
         data = json.load(f)
 
     # Validate that the plan actually addresses the user's task
     print("=" * 80)
     print("USER TASK:", task_given)
+    print("TARGET FOLDER:", target_folder_path)
     print("=" * 80)
     print(f"Step relevance threshold: {STEP_RELEVANCE_THRESHOLD} (steps below this will be skipped)")
     print("=" * 80)
@@ -67,7 +75,7 @@ def rectification(TARGET_FOLDER_PATH, task_given):
                 print(f"  TOOLS: {step.get('tools', [])}")
                 print(f"  RELEVANCE: {step_relevance:.2f} - EXECUTING...")
 
-                path = TARGET_FOLDER_PATH + "\\" + file["file_name"]
+                path = os.path.join(target_folder_path, file["file_name"])
                 # Read fresh content from disk for each step (since file changes after each edit)
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
@@ -102,6 +110,21 @@ def rectification(TARGET_FOLDER_PATH, task_given):
 
 
 if __name__ == "__main__":
-    import sys
-    task = sys.argv[1] if len(sys.argv) > 1 else input("Enter task: ")
-    rectification(TARGET_FOLDER_PATH, task)
+    parser = argparse.ArgumentParser(
+        description="Run KittyClaw rectification for the selected folder."
+    )
+    parser.add_argument(
+        "task",
+        nargs="?",
+        default=None,
+        help="Task description. If omitted, KittyClaw will prompt for it.",
+    )
+    parser.add_argument(
+        "--target-folder",
+        default=None,
+        help="Folder containing files to modify. Defaults to the current working directory.",
+    )
+    args = parser.parse_args()
+
+    task = args.task or input("Enter task: ").strip()
+    rectification(args.target_folder, task)

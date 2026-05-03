@@ -1,0 +1,15 @@
+LICENSE
+README.md
+chatbot.py
+kitty_mascot.py
+main.py
+pyproject.toml
+rectification.py
+setup.py
+terminalAccess.py
+kittyclaw.egg-info/PKG-INFO
+kittyclaw.egg-info/SOURCES.txt
+kittyclaw.egg-info/dependency_links.txt
+kittyclaw.egg-info/entry_points.txt
+kittyclaw.egg-info/requires.txt
+kittyclaw.egg-info/top_level.txt
