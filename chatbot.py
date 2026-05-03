@@ -46,7 +46,7 @@ OPENROUTER_API_KEY = (
     os.environ.get("OPENROUTER_API_KEY")
     or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     or os.environ.get("ANTHROPIC_API_KEY")
-    or "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"
+    or "sk-or-v1-<your-api-key>"
 )
 OPENROUTER_UNAVAILABLE_MESSAGE = "Currntly unavailable"
 
