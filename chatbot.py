@@ -43,23 +43,58 @@ OPENROUTER_MODEL = os.environ.get(
 )
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Ensure OpenRouter API key is available. Prompt on first run and store it in ~/.kittyclaw/.env.
-config_dir = os.path.join(os.path.expanduser("~"), ".kittyclaw")
-env_path = os.path.join(config_dir, ".env")
+from pathlib import Path
 
-def _load_api_key():
-    """Prompt the user for their OpenRouter API key every time.
-    This version never reads or writes a persistent .env file, ensuring that a fresh
-    key is requested on each fresh installation or run. The key is stored only in the
-    current process's environment for the duration of the session.
+# Directory where the persistent .env will be stored (e.g., C:\Users\<user>\.kittyclaw\.env)
+CONFIG_DIR = Path.home() / ".kittyclaw"
+CONFIG_FILE = CONFIG_DIR / ".env"
+
+def _parse_env_file(path: Path) -> dict:
+    """Parse a simple KEY=VALUE .env file.
+    Ignores blank lines and comments starting with '#'.
+    Returns a dict of environment variables.
     """
-    print("\n=== Kitty Claw Setup ===")
+    env = {}
+    if not path.is_file():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        env[k.strip()] = v.strip().strip('"\'')
+    return env
+
+def _write_env_file(path: Path, key: str, value: str) -> None:
+    """Write a single KEY=VALUE line to the .env file, creating parent dirs as needed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(f"{key}={value}\n")
+
+def _load_api_key() -> str:
+    """Load the OpenRouter API key from persistent storage or prompt once.
+    The function checks ``~/.kittyclaw/.env`` for ``OPENROUTER_API_KEY``.
+    If the file or key is missing, it prompts the user, saves the key for
+    future runs, and returns it.
+    """
+    # 1️⃣ Try loading from the persistent .env file.
+    if CONFIG_FILE.is_file():
+        env = _parse_env_file(CONFIG_FILE)
+        if "OPENROUTER_API_KEY" in env:
+            return env["OPENROUTER_API_KEY"]
+
+    # 2️⃣ Prompt the user – this runs only on first launch.
     while True:
-        key = input("Enter your OpenRouter API key (starts with 'sk-'): ").strip()
+        key = input("\n=== Kitty Claw Setup ===\nEnter your OpenRouter API key (starts with 'sk-'): ").strip()
         if key.lower().startswith("sk-") and len(key) > 10:
             break
         print("Invalid format. Please try again.")
-    # Store the key in the environment for this run only (no file persistence)
-    os.environ["OPENROUTER_API_KEY"] = key
+
+    # 3️⃣ Persist the key for future executions.
+    _write_env_file(CONFIG_FILE, "OPENROUTER_API_KEY", key)
+    print(f"✅ OpenRouter API key saved to {CONFIG_FILE}\n")
     return key
 
 OPENROUTER_API_KEY = (
