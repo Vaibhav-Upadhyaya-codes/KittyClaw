@@ -11,7 +11,7 @@ PY_MODULES = [
 
 setup(
     name="kittyclaw",
-    version="0.1.1",
+    version="0.2.0",
     description="Kitty Claw - AI-powered code rectification agent with a cute terminal mascot",
     author="Vaibhav Upadhyaya",
     python_requires=">=3.8",
