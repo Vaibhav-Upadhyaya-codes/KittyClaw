@@ -37,7 +37,7 @@ def _load_claude_env():
 
 _load_claude_env()
 
-DEFAULT_OLLAMA_MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
+DEFAULT_OLLAMA_MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "gpt-oss:120b-cloud")
 OPENROUTER_MODEL = os.environ.get(
     "OPENROUTER_MODEL",
     os.environ.get("ANTHROPIC_MODEL", "openrouter/free"),

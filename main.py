@@ -422,6 +422,11 @@ def store_json_data_in_chromadb(
     )
 
     client = chromadb.PersistentClient(path=db_path)
+    # Remove any existing collection that may have been created with a different embedding dimension
+    try:
+        client.delete_collection(name=resolved_collection_name)
+    except Exception:
+        pass
     collection = client.get_or_create_collection(
         name=resolved_collection_name,
         embedding_function=embedding_functions.DefaultEmbeddingFunction(),

@@ -1,14 +1,14 @@
 {
-  "task": "create a virtual env",
+  "task": "list all the files in this folder",
   "plan": [
     {
-      "step": "Execute python -m venv venv to create the virtual environment",
+      "step": "Run Get-Location to verify the current working directory",
       "tools": [
         "powershell"
       ]
     },
     {
-      "step": "Verify the venv directory exists using Test-Path",
+      "step": "Execute Get-ChildItem -File to list all files in the current folder",
       "tools": [
         "powershell"
       ]

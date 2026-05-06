@@ -13,7 +13,6 @@ from chatbot import (
     ollama_chat_with_status,
 )
 
-MODEL = "qwen3.5:397b-cloud"
 JSON_FILE = "instance.json"
 TERMINAL_PLAN_FILE = "terminal_plan.json"
 DEFAULT_MAX_ITERATIONS = 20
@@ -363,7 +362,6 @@ def generate_terminal_plan(task):
     """Generate a step-by-step plan for a terminal automation task."""
     response = ollama_chat_with_status(
         "Planning terminal task",
-        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -414,7 +412,6 @@ def generate_command(task, plan, working_directory):
 
     response = ollama_chat_with_status(
         "Choosing terminal command",
-        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -559,7 +556,6 @@ def generate_next_action(task, plan, working_directory):
 
     response = ollama_chat_with_status(
         "Choosing next action",
-        model=MODEL,
         messages=[
             {
                 "role": "system",
