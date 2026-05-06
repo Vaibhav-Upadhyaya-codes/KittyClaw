@@ -11,22 +11,26 @@ from terminalAccess import run_terminal_task
 DEFAULT_DB_ROOT = os.environ.get("LOCALAPPDATA", os.getcwd())
 CHROMA_DB_PATH = os.path.join(DEFAULT_DB_ROOT, "SoftMother", "chroma_db")
 
-MODEL = "qwen3.5:397b-cloud"
-SUMMARY_MODEL = "qwen3.5:397b-cloud"
-FLAG_MODEL = "qwen3.5:397b-cloud"
+SUMMARY_MODEL = None
+FLAG_MODEL = None
 CHAT_EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
-CHAT_SYSTEM_PROMPTS = {
-    "ollama": (
+
+
+def get_chat_system_prompt(provider):
+    """Build the system prompt for the active chat backend."""
+    if provider == "openrouter":
+        return (
+            "You are KittyClaw's normal conversation assistant running on the OpenRouter "
+            "pipeline with the openrouter/free model. Reply like a helpful, natural "
+            "chatbot. Be conversational, clear, and concise."
+        )
+
+    ollama_model = get_active_ollama_model()
+    return (
         "You are KittyClaw's normal conversation assistant running on the Ollama "
-        "pipeline with the qwen3.5:397b-cloud model. Reply like a helpful, natural "
+        f"pipeline with the {ollama_model} model. Reply like a helpful, natural "
         "chatbot. Be conversational, clear, and concise."
-    ),
-    "openrouter": (
-        "You are KittyClaw's normal conversation assistant running on the OpenRouter "
-        "pipeline with the openrouter/free model. Reply like a helpful, natural "
-        "chatbot. Be conversational, clear, and concise."
-    ),
-}
+    )
 
 
 def resolve_target_folder(target_folder=None):
@@ -50,13 +54,13 @@ def get_chat_pipeline_name(provider):
     """Return the human-readable chat pipeline label for the active backend."""
     if provider == "openrouter":
         return "OpenRouter conversation pipeline (openrouter/free)"
-    return "Ollama conversation pipeline (qwen3.5:397b-cloud)"
+    return f"Ollama conversation pipeline ({get_active_ollama_model()})"
 
 
 def run_chat_pipeline(message, conversation_history):
     """Reply as a normal chatbot using the selected provider pipeline."""
     provider = get_llm_provider()
-    system_prompt = CHAT_SYSTEM_PROMPTS.get(provider, CHAT_SYSTEM_PROMPTS["ollama"])
+    system_prompt = get_chat_system_prompt(provider)
 
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(conversation_history)

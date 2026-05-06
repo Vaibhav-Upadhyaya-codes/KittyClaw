@@ -7,6 +7,7 @@ import time
 import itertools
 import sys
 import ollama
+from typing import List, Optional
 from chromadb.utils import embedding_functions
 
 
@@ -36,7 +37,7 @@ def _load_claude_env():
 
 _load_claude_env()
 
-MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
+DEFAULT_OLLAMA_MODEL = os.environ.get("SOFTMOTHER_OLLAMA_MODEL", "qwen3.5:397b-cloud")
 OPENROUTER_MODEL = os.environ.get(
     "OPENROUTER_MODEL",
     os.environ.get("ANTHROPIC_MODEL", "openrouter/free"),
@@ -99,8 +100,6 @@ def _load_api_key() -> str:
 
 OPENROUTER_API_KEY = (
     os.environ.get("OPENROUTER_API_KEY")
-    or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    or os.environ.get("ANTHROPIC_API_KEY")
     or _load_api_key()
 )
 OPENROUTER_UNAVAILABLE_MESSAGE = "Currntly unavailable"
@@ -117,7 +116,9 @@ def normalize_openrouter_model(model):
         model = "openrouter/free"
     return model
 LLM_PROVIDER_ENV = "SOFTMOTHER_LLM_PROVIDER"
+OLLAMA_MODEL_ENV = "SOFTMOTHER_OLLAMA_MODEL"
 ACTIVE_LLM_PROVIDER = None
+ACTIVE_OLLAMA_MODEL = None
 FILE_CONTEXT_JSON = "fileContent.json"
 PLAN_OUTPUT_JSON = "plan.json"
 DEFAULT_CHROMA_COLLECTION = "file_contents"
@@ -215,6 +216,176 @@ def set_llm_provider(provider):
     return normalized
 
 
+def _extract_ollama_model_name(model_entry):
+    """Return a model name from an Ollama list entry."""
+    if isinstance(model_entry, dict):
+        return (
+            model_entry.get("model")
+            or model_entry.get("name")
+            or ""
+        ).strip()
+
+    for attr in ("model", "name"):
+        value = getattr(model_entry, attr, "")
+        if value:
+            return str(value).strip()
+
+    return ""
+
+
+def list_available_ollama_models():
+    """Return available Ollama model names, or an empty list when listing fails.
+
+    First attempts to use the ``ollama`` Python client. If that raises an
+    exception (e.g., the client is not installed or the Ollama daemon is not
+    running), we fall back to invoking the ``ollama list`` CLI via ``subprocess``.
+    This improves robustness on systems where the Python wrapper is unavailable
+    but the CLI is present.
+    """
+    # Primary attempt: use the Python client (if it works)
+    try:
+        response = ollama.list()
+    except Exception:
+        response = None
+
+    # If the client call succeeded and returned a structure, extract names
+    if response:
+        models = []
+        if isinstance(response, dict):
+            models = response.get("models") or []
+        else:
+            models = getattr(response, "models", []) or []
+    else:
+        # Fallback: run ``ollama list`` via subprocess and parse the JSON output
+        try:
+            # Try to get JSON output via ``ollama list -j`` – newer versions support it.
+            import json as _json
+            result = subprocess.run(
+                ["ollama", "list", "-j"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            parsed = _json.loads(result.stdout)
+            models = parsed.get("models", [])
+        except Exception:
+            # Fallback: parse the standard tabular output (first column is the model name).
+            try:
+                result = subprocess.run(
+                    ["ollama", "list"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                lines = result.stdout.splitlines()
+                # Skip header lines that contain 'NAME' or are empty
+                models = []
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.upper().startswith("NAME"):
+                        continue
+                    # First whitespace-separated token is the model name
+                    model_name = line.split()[0]
+                    models.append({"name": model_name})
+            except Exception:
+                # If everything fails, return an empty list – the caller will use the default.
+                return []
+
+    # Normalise the entries to simple model names
+    names = []
+    seen = set()
+    for entry in models:
+        name = _extract_ollama_model_name(entry)
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
+
+
+def set_ollama_model(model_name):
+    """Persist the selected Ollama model for the current process."""
+    global ACTIVE_OLLAMA_MODEL
+
+    normalized = str(model_name or "").strip()
+    if not normalized:
+        raise ValueError("Ollama model name cannot be empty.")
+
+    ACTIVE_OLLAMA_MODEL = normalized
+    os.environ[OLLAMA_MODEL_ENV] = normalized
+    return normalized
+
+
+def get_active_ollama_model():
+    """Return the current Ollama model without prompting the user."""
+    return ACTIVE_OLLAMA_MODEL or os.environ.get(OLLAMA_MODEL_ENV) or DEFAULT_OLLAMA_MODEL
+
+
+def _resolve_ollama_model_choice(choice, available_models):
+    """Resolve a numeric or exact-name Ollama model selection."""
+    raw_choice = str(choice or "").strip()
+    if not raw_choice:
+        return None
+
+    if raw_choice.isdigit():
+        index = int(raw_choice) - 1
+        if 0 <= index < len(available_models):
+            return available_models[index]
+
+    for model_name in available_models:
+        if raw_choice.lower() == model_name.lower():
+            return model_name
+
+    return None
+
+
+def choose_ollama_model(preferred=None, prompt_user=True):
+    """Select the Ollama model once, prompting the user when possible."""
+    global ACTIVE_OLLAMA_MODEL
+
+    if ACTIVE_OLLAMA_MODEL:
+        return ACTIVE_OLLAMA_MODEL
+
+    configured_model = str(
+        preferred or os.environ.get(OLLAMA_MODEL_ENV) or DEFAULT_OLLAMA_MODEL
+    ).strip()
+
+    if not prompt_user or not getattr(sys.stdin, "isatty", lambda: False)():
+        return set_ollama_model(configured_model)
+
+    available_models = list_available_ollama_models()
+    if not available_models:
+        print(
+            f"Could not list Ollama models. Configured default: {configured_model}"
+        )
+        manual = input(
+            "Enter model name manually, or press Enter to keep the default: "
+        ).strip()
+        if manual:
+            print(f"Using manually entered model: {manual}")
+            return set_ollama_model(manual)
+        return set_ollama_model(configured_model)
+
+    default_model = configured_model if configured_model in available_models else available_models[0]
+
+    print("\nAvailable Ollama models:")
+    for index, model_name in enumerate(available_models, start=1):
+        marker = " (default)" if model_name == default_model else ""
+        print(f"{index}. {model_name}{marker}")
+
+    while True:
+        choice = input(
+            f"Select Ollama model [1-{len(available_models)}] "
+            f"or press Enter for {default_model}: "
+        ).strip()
+        if not choice:
+            return set_ollama_model(default_model)
+
+        selected_model = _resolve_ollama_model_choice(choice, available_models)
+        if selected_model:
+            return set_ollama_model(selected_model)
+        print("Please choose a valid model number or exact model name from the list.")
+
+
 def choose_llm_provider(preferred=None, prompt_user=True):
     """Select the LLM backend once, prompting the user when needed."""
     global ACTIVE_LLM_PROVIDER
@@ -226,10 +397,15 @@ def choose_llm_provider(preferred=None, prompt_user=True):
         os.environ.get(LLM_PROVIDER_ENV)
     )
     if preset:
-        return set_llm_provider(preset)
+        selected_provider = set_llm_provider(preset)
+        if selected_provider == "ollama":
+            choose_ollama_model(prompt_user=prompt_user)
+        return selected_provider
 
     if not prompt_user or not getattr(sys.stdin, "isatty", lambda: False)():
-        return set_llm_provider("ollama")
+        selected_provider = set_llm_provider("ollama")
+        choose_ollama_model(prompt_user=False)
+        return selected_provider
 
     print("\nChoose the LLM backend:")
     print("1. OpenRouter (cloud)")
@@ -239,7 +415,10 @@ def choose_llm_provider(preferred=None, prompt_user=True):
         choice = input("Select backend [1/2]: ").strip()
         normalized = normalize_llm_provider(choice)
         if normalized:
-            return set_llm_provider(normalized)
+            selected_provider = set_llm_provider(normalized)
+            if selected_provider == "ollama":
+                choose_ollama_model(prompt_user=prompt_user)
+            return selected_provider
         print("Please choose 1 for OpenRouter or 2 for Ollama.")
 
 
@@ -252,7 +431,7 @@ def resolve_chat_model(requested_model=None):
     """Map chat prompts to the active backend's model."""
     if get_llm_provider() == "openrouter":
         return normalize_openrouter_model(OPENROUTER_MODEL)
-    return requested_model or MODEL
+    return requested_model or get_active_ollama_model()
 
 
 def get_chroma_embedding_function():
@@ -652,7 +831,6 @@ def planner(task, file_entry):
 
     response = ollama_chat_with_status(
         "Planning",
-        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -703,7 +881,6 @@ def refinedTask(task, file_entry):
 
     response = ollama_chat_with_status(
         "Refining task",
-        model=MODEL,
         messages=[
             {
                 "role": "system",
@@ -752,7 +929,6 @@ def validate_plan_against_task(task_given, refined_task, step):
     try:
         response = ollama_chat_with_status(
             "Validating",
-            model=MODEL,
             messages=[
                 {
                     "role": "system",
@@ -949,7 +1125,6 @@ def apply_file_edit(file_path, current_content, step_description):
     try:
         response = ollama_chat_with_status(
             "Fixing code",
-            model='qwen3.5:397b-cloud',
             messages=[
                 {
                     'role': 'system',
