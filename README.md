@@ -7,6 +7,10 @@ Kitty Claw helps you identify and fix issues in your codebase. It combines AI-po
 ## Installation
 
 ### Quick Install (Recommended)
+One line installation
+```Powershell
+pip install kittyclaw
+```
 
 Run one of these commands to install Kitty Claw:
 
